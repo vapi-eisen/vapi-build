@@ -76,7 +76,7 @@ def _extract_website(ledger: _Ledger, source: dict[str, Any], inventory: dict[st
         if not blocks:
             ledger.gaps.append({"source": source["id"], "locator": item["locator"], "reason": "No static body text (JavaScript-rendered or empty page)."})
             continue
-        path_slug = slug(re.sub(r"^https?://[^/]+", "", item["locator"]) or "home", 40)
+        path_slug = slug(re.sub(r"^https?://[^/]+", "", item["locator"]).strip("/") or "home", 40)
         key = ledger.segment_id(prefix, path_slug)
         title = page["title"] or item["locator"]
         heading = [("title", title)] if title and not any(b[1] == title for b in blocks[:1]) else []

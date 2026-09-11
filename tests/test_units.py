@@ -59,7 +59,7 @@ def test_openapi_schema_projection_and_names():
     assert schema["properties"]["id"] == {"type": "string", "format": "uuid"}
     assert schema["properties"]["name"] == {"type": "string"} and schema["properties"]["tags"]["items"] == {"type": "string"}
     assert schema["properties"]["extra"]["type"] == "integer" and schema["required"] == ["id", "name"]
-    assert op["classification"]["risk"] == "MEDIUM" and op["classification"]["confirmBeforeCall"] is False
+    assert op["classification"]["risk"] == "MEDIUM" and op["classification"]["confirmBeforeCall"] is True  # every write confirms
     taken = set()
     assert openapi.tool_name("update-thing", taken) == "update-thing"
     assert openapi.tool_name("update-thing", taken) == "update-thing_2"

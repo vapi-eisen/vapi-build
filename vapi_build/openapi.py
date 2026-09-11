@@ -56,7 +56,8 @@ def classify(method: str, path: str, operation_id: str, operation: dict[str, Any
         "financial": financial,
         "identitySensitive": identity,
         "risk": risk,
-        "confirmBeforeCall": (not read) and (destructive or financial or risk in {"HIGH", "PRIVILEGED"}),
+        # Every write confirms by default; a login-style call is the exception since there is nothing to read back.
+        "confirmBeforeCall": (not read) and not (identity and not (destructive or financial)),
     }
 
 
