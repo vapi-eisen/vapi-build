@@ -69,7 +69,7 @@ Fix every ERROR and re-run, up to five rounds; if still failing, show the user t
 $VB render ontology <ws>        # writes <ws>/ontology/ontology.html
 $VB summarize ontology <ws>     # plain text, for your own reading
 ```
-**Gate 1.** The deliverable is the rendered page, not a wall of text. Publish `<ws>/ontology/ontology.html` with the Artifact tool (title is already in the file; pass a favicon such as 🧭 on the first publish, and reuse the same file path on every republish so the link stays stable) and give the user the link. The page has a graph of goals, products, types, procedures, capabilities, and rules; a browse view for facts, observations, and issues; and a detail panel that opens on click and shows every record's evidence as the quoted source text. In chat, keep it to a few lines: the link, the two or three things worth their attention (conflicts, gaps, decisions the plan will need), and the question "what is wrong or missing?" Revise, re-check, re-render, and republish on request. On yes: `$VB approve ontology <ws>`.
+**Gate 1.** The deliverable is the rendered page, not a wall of text. Publish `<ws>/ontology/ontology.html` with the Artifact tool (title is already in the file; pass a favicon such as 🧭 on the first publish, and reuse the same file path on every republish so the link stays stable) and give the user the link, then run `$VB open <link>` so it opens in their default browser as well. The page opens on its graph of goals, products, types, procedures, capabilities, and rules; a browse view for facts, observations, and issues; and a detail panel that opens on click and shows every record's evidence as the quoted source text. In chat, keep it to a few lines: the link, the two or three things worth their attention (conflicts, gaps, decisions the plan will need), and the question "what is wrong or missing?" Revise, re-check, re-render, and republish on request. On yes: `$VB approve ontology <ws>`.
 
 ## Plan
 Write `<ws>/plan/plan.json` per the plan guide, then:
@@ -78,14 +78,14 @@ $VB check plan <ws>
 $VB render plan <ws>            # writes <ws>/plan/plan.html
 $VB summarize plan <ws>
 ```
-Fix errors the same way. **Gate 2.** Publish `<ws>/plan/plan.html` as an Artifact (favicon such as 🎧 on first publish; same path on republish) and give the link. Its graph shows assistants, jobs, goals, and tools; its Overview carries the runtime and the check's "operations the agent will be able to call" list, which you also read to the user verbatim in chat because it carries each operation's risk and whether the agent confirms before calling it. Ask which to keep. On yes: `$VB approve plan <ws>`.
+Fix errors the same way. **Gate 2.** Publish `<ws>/plan/plan.html` as an Artifact (favicon such as 🎧 on first publish; same path on republish), give the link, and run `$VB open <link>` to launch it in the user's default browser. The plan page opens on its Overview tab; its graph shows assistants, jobs, goals, and tools; its Overview carries the runtime and the check's "operations the agent will be able to call" list, which you also read to the user verbatim in chat because it carries each operation's risk and whether the agent confirms before calling it. Ask which to keep. On yes: `$VB approve plan <ws>`.
 
 ## Build, test, hand over
 ```bash
 $VB compile <ws>
 $VB render plan <ws>            # the plan page now carries a Build section from vapi/build.json
 ```
-**Gate 3.** Republish `<ws>/plan/plan.html` (same path, so the same link) and point the user at its Build tables: knowledge files, tools with URLs and auth, assistants, squad. `<ws>/vapi/summary.md` holds the same in text. `compile` also reports which token variables are present in or missing from `~/.config/vapi-build/env`; copy any missing one with `$VB secrets set NAME --from-env NAME` (or `--from-file`) after asking the user where it lives, and confirm the Vapi key is in place (`$VB doctor`). On yes:
+**Gate 3.** Republish `<ws>/plan/plan.html` (same path, so the same link), `$VB open` it again, and point the user at its Build tables: knowledge files, tools with URLs and auth, assistants, squad. `<ws>/vapi/summary.md` holds the same in text. `compile` also reports which token variables are present in or missing from `~/.config/vapi-build/env`; copy any missing one with `$VB secrets set NAME --from-env NAME` (or `--from-file`) after asking the user where it lives, and confirm the Vapi key is in place (`$VB doctor`). On yes:
 ```bash
 $VB apply <ws> --yes
 $VB test <ws>          # when the plan has tests
@@ -100,4 +100,5 @@ Judge each chat transcript against its `expect` and `mustNot` lines and report a
 | `init`, `add`, `fetch`, `extract` | workspace, sources, raw material, evidence ledger and packets |
 | `merge` | fold `ontology/fragments/*.json` into `ontology/ontology.json` |
 | `check`, `render`, `summarize`, `approve` (`ontology` or `plan`) | validate, write the interactive HTML review page, plain-text summary, record the user's yes |
+| `open <url>` | launch a published artifact link in the user's default browser |
 | `compile`, `apply --yes`, `test`, `verify`, `status`, `teardown --yes` | build, create, exercise, read back, show, remove |

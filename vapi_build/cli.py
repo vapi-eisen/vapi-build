@@ -136,6 +136,16 @@ def cmd_render(args) -> int:
     return 0
 
 
+def cmd_open(args) -> int:
+    import webbrowser
+
+    if not str(args.url).startswith("https://"):
+        raise BuildError("open takes an https URL, normally the published artifact link.")
+    opened = webbrowser.open(args.url, new=2)
+    print(f"Opened {args.url} in the default browser." if opened else f"Could not open a browser; give the user the link: {args.url}")
+    return 0
+
+
 def cmd_approve(args) -> int:
     workspace = _workspace(args)
     approval = ontology.approve_ontology(workspace, by=args.by) if args.stage == "ontology" else plan.approve_plan(workspace, by=args.by)
@@ -375,6 +385,10 @@ def build_parser() -> argparse.ArgumentParser:
     a = actions.add_parser("prompt", help="interactive: paste a value at a hidden terminal prompt and save it")
     a.add_argument("name")
     a.set_defaults(func=cmd_secrets)
+
+    p = sub.add_parser("open", help="open a published artifact link in the user's default browser")
+    p.add_argument("url")
+    p.set_defaults(func=cmd_open)
 
     p = sub.add_parser("merge", help="combine ontology/fragments/*.json into ontology/ontology.json")
     p.add_argument("workspace")

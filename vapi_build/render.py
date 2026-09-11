@@ -342,6 +342,7 @@ def ontology_model(candidate: dict[str, Any], evidence: dict[str, dict[str, Any]
     status = (check or {}).get("status")
     return {
         "page": "ontology",
+        "defaultView": "graph",
         "title": domain.get("name") or "Ontology",
         "subtitle": "Evidence-linked ontology for review",
         "summary": domain.get("summary", ""),
@@ -527,6 +528,7 @@ def plan_model(candidate: dict[str, Any], ontology: dict[str, Any], evidence: di
         }
     return {
         "page": "plan",
+        "defaultView": "overview",
         "title": agent.get("name") or "Agent plan",
         "subtitle": "Agent plan for review",
         "summary": agent.get("purpose", ""),
@@ -557,6 +559,8 @@ def _json_for_script(value: Any) -> str:
 def render_page(model: dict[str, Any]) -> str:
     title = html.escape(model["title"])
     data = _json_for_script(model)
+    default_view = model.get("defaultView", "graph")
+    on = {v: (" is-on" if v == default_view else "") for v in ("graph", "browse", "overview")}
     return f"""<meta charset="utf-8">
 <title>{title}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -569,20 +573,20 @@ def render_page(model: dict[str, Any]) -> str:
       <div><h1 id="title">{title}</h1><div class="sub" id="subtitle"></div></div>
     </div>
     <nav class="views" role="tablist">
-      <button class="view-btn is-on" data-view="graph" role="tab">Graph</button>
-      <button class="view-btn" data-view="browse" role="tab">Browse</button>
-      <button class="view-btn" data-view="overview" role="tab">Overview</button>
+      <button class="view-btn{on['graph']}" data-view="graph" role="tab">Graph</button>
+      <button class="view-btn{on['browse']}" data-view="browse" role="tab">Browse</button>
+      <button class="view-btn{on['overview']}" data-view="overview" role="tab">Overview</button>
     </nav>
     <label class="search"><span class="sr">Search</span><input id="search" type="search" placeholder="Search records, facts, phrases…" autocomplete="off"></label>
   </header>
   <div class="body">
     <main class="stage">
-      <section id="view-graph" class="view is-on">
+      <section id="view-graph" class="view{on['graph']}">
         <div class="graph-bar"><div id="legend" class="legend"></div><div class="graph-hint">Drag to move · scroll to zoom · click a node for details and evidence</div></div>
         <svg id="graph" role="img" aria-label="Record graph"></svg>
       </section>
-      <section id="view-browse" class="view"><div id="browse"></div></section>
-      <section id="view-overview" class="view"><div id="overview"></div></section>
+      <section id="view-browse" class="view{on['browse']}"><div id="browse"></div></section>
+      <section id="view-overview" class="view{on['overview']}"><div id="overview"></div></section>
     </main>
     <aside id="detail" class="detail" aria-live="polite">
       <div class="detail-empty"><p>Select a node or a row to see its definition, related records, and the evidence behind it.</p></div>
@@ -1004,6 +1008,7 @@ JS = r"""
     svg.attr('viewBox', [-box.width / 2, -box.height / 2, box.width, box.height].join(' '));
   }
   window.addEventListener('resize', resize); resize();
+  if (!$('#view-graph').classList.contains('is-on')) { const g = $('#view-graph'); g.style.display = 'flex'; g.style.visibility = 'hidden'; resize(); g.style.display = ''; g.style.visibility = ''; }
   function lit(id) {
     if (!id) { node.classed('dim', false).classed('lit-label', false); link.classed('dim', false).classed('lit', false); return; }
     const near = neighbors.get(id) || new Set();
