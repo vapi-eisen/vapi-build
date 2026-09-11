@@ -20,6 +20,11 @@ from .workspace import USER_AGENT, BuildError, Workspace, read_json, utc_now, wr
 
 Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, bytes]]
 KEY_VARIABLES = ("VAPI_API_KEY", "VAPI_PRIVATE_KEY")
+# Vapi's accepted upload types; Python's mimetypes does not know some of these extensions (yaml, log, tsv).
+UPLOAD_TYPES = {"md": "text/markdown", "markdown": "text/markdown", "txt": "text/plain", "yaml": "application/x-yaml", "yml": "application/x-yaml",
+                "json": "application/json", "csv": "text/csv", "tsv": "text/tab-separated-values", "log": "text/x-log", "html": "text/html", "htm": "text/html",
+                "xml": "application/xml", "pdf": "application/pdf", "doc": "application/msword",
+                "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
 
 
 def default_transport(method: str, url: str, headers: dict[str, str], data: bytes | None) -> tuple[int, bytes]:
@@ -54,7 +59,7 @@ class VapiClient:
 
     def upload(self, name: str, data: bytes, *, purpose: str = "knowledge-base-v2", metadata: dict[str, Any] | None = None) -> Any:
         boundary = f"----vapi-build-{uuid.uuid4().hex}"
-        content_type = mimetypes.guess_type(name)[0] or ("text/markdown" if name.endswith(".md") else "application/octet-stream")
+        content_type = UPLOAD_TYPES.get(name.rsplit(".", 1)[-1].lower()) or mimetypes.guess_type(name)[0] or "text/plain"
         parts = [f"--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{purpose}\r\n".encode()]
         if metadata:
             parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{json.dumps(metadata)}\r\n".encode())
