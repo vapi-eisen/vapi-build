@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 
 import pytest
 
@@ -216,3 +217,20 @@ def test_speech_ivr_logs_group_by_call_and_keep_prompt_and_no_match():
     plain = "id,reason,transcript\n1,Refund,Customer said hi\n2,Schedule,Customer asked times\n"
     plain_conversations = list(transcripts.conversations_from_csv(io.StringIO(plain), "plain.csv"))
     assert [c["fields"]["reason"] for c in plain_conversations] == ["Refund", "Schedule"]
+
+
+def test_skill_packaging_for_codex_and_upstream():
+    """What VapiAI/skills' Codex packager and Codex itself need from the skill folder."""
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "SKILL.md").read_text()
+    head, frontmatter, _ = text.split("---\n", 2)
+    assert head == ""
+    top_keys = re.findall(r"^([a-z-]+):", frontmatter, flags=re.M)
+    assert top_keys.count("compatibility") == 1 and top_keys.count("metadata") == 1
+    assert len(text.splitlines()) <= 500
+    yaml_text = (root / "agents" / "openai.yaml").read_text()
+    for key in ("display_name", "short_description", "default_prompt"):
+        assert f"  {key}: " in yaml_text
+    assert "$vapi-build" in yaml_text

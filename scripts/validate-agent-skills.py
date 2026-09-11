@@ -14,15 +14,15 @@ def main() -> None:
     parser.add_argument(
         "skills",
         nargs="*",
-        help="Skill directory names. Defaults to every top-level skill.",
+        help="Skill directories. Defaults to this project, which is itself one skill.",
     )
     args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parent.parent
     skill_dirs = (
-        [repo_root / skill_name for skill_name in args.skills]
+        [Path(skill_name).resolve() for skill_name in args.skills]
         if args.skills
-        else discover_skills(repo_root)
+        else ([project_root] if (project_root / "SKILL.md").is_file() else discover_skills(project_root))
     )
     if not skill_dirs:
         raise SystemExit("No skills found")

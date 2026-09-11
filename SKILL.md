@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires Python 3.11+ with jsonschema (PyYAML for YAML sources, boto3 for S3 sources), internet access, and a Vapi private API key (VAPI_API_KEY) for apply, test, simulate, and teardown. Everything up to compile runs without a key.
 metadata:
   author: vapi
-  version: "0.2"
+  version: "0.3"
 ---
 
 # vapi-build
@@ -17,12 +17,20 @@ You do all the work. The user names their material, answers your questions, and 
 **Launcher.** `scripts/vapi-build` inside this skill's directory works from any location. Set it once per shell command and call `$VB <command>`:
 
 ```bash
-VB="$(ls ~/.claude/skills/vapi-build/scripts/vapi-build .claude/skills/vapi-build/scripts/vapi-build 2>/dev/null | head -1)"
+VB="$(ls ~/.claude/skills/vapi-build/scripts/vapi-build .claude/skills/vapi-build/scripts/vapi-build ~/.agents/skills/vapi-build/scripts/vapi-build .agents/skills/vapi-build/scripts/vapi-build projects/vapi-build/scripts/vapi-build 2>/dev/null | head -1)"
 ```
 
 If neither path exists, use `<this skill's directory>/scripts/vapi-build`. Guides for what you write: [references/ontology.md](references/ontology.md), [references/plan.md](references/plan.md), [references/vapi.md](references/vapi.md).
 
 **Related skills.** When they are installed, follow `vapi-prompt-builder` for prompt quality, `create-squad` for handoff design, `create-structured-output` for schema design, and `simulations` for scenario design while writing the plan. This skill's CLI performs every Vapi API call and records what it created; do not call the API directly alongside it.
+
+## Where you are running
+
+The steps are the same everywhere; only the tooling around them differs.
+
+- **Claude Code.** Ask the intake questions with the structured question tool, fan out ontology packets with subagents, let `open` launch the browser, and publish `review.html` with the artifact tool when a shareable link helps.
+- **Codex.** The user invokes `$vapi-build`. Ask the intake questions in one plain message and read packets sequentially unless a subagent tool exists. `open` launches the local browser. The sandbox asks for network approval the first time `fetch`, `apply`, or `simulate` reaches the network; say what the command is about to reach before it runs.
+- **Claude (claude.ai and the desktop app).** The skill runs in the code-execution sandbox: no browser, no shell profile, and nothing outlives the conversation. The user uploads a `.env`-style file instead of pasting a key; run `$VB secrets set VAPI_API_KEY --from-file <uploaded path> --var VAPI_API_KEY --verify` and never echo its contents. Skip `open`; hand the user `<ws>/review.html` as a file after every `render` (publish it as an artifact when that tool exists). Sources and the Vapi API need network egress, which Team and Enterprise organizations disable by default; if `fetch` or `doctor --verify` fails on the network, say so and stop. Put every created resource ID in your final message, because the workspace and its receipts vanish with the conversation.
 
 ## Hard rules
 
