@@ -179,7 +179,13 @@ def cmd_apply(args) -> int:
         return 1
     client = vapi.client_from_env()
     receipts = vapi.apply(workspace, client)
-    print(f"Applied. knowledge base {receipts['knowledgeBase']['id']} (search tool {receipts['knowledgeBase']['toolId']})")
+    kb = receipts["knowledgeBase"]
+    if kb.get("mode") == "query":
+        print(f"Applied. knowledge: query tool {kb.get('toolId')} over {len(kb.get('attached', []))} files (organization has no Knowledge Bases V2)")
+        if kb.get("failedFiles"):
+            print(f"  warn  Vapi marks {len(kb['failedFiles'])} file(s) failed; the query tool's provider indexes them itself, so check a knowledge question in `test`.")
+    else:
+        print(f"Applied. knowledge base {kb.get('id')} (search tool {kb.get('toolId')})")
     for ref, identifier in receipts["tools"].items():
         print(f"  {ref} → {identifier}")
     for ref, identifier in receipts["assistants"].items():
