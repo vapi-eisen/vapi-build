@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, compile as compiler, extract, keyfile, ontology, plan, sources, vapi
+from . import __version__, compile as compiler, extract, keyfile, ontology, plan, render, sources, vapi
 from .workspace import BuildError, Workspace, read_json
 
 DEFAULT_ROOT = "~/vapi-build-projects"
@@ -125,6 +125,14 @@ def cmd_summarize(args) -> int:
     else:
         text = plan.summarize(plan.load_candidate(workspace), ontology.approved_ontology(workspace))
     print(text)
+    return 0
+
+
+def cmd_render(args) -> int:
+    workspace = _workspace(args)
+    path = render.render_ontology(workspace) if args.stage == "ontology" else render.render_plan(workspace)
+    print(f"Wrote {path}")
+    print("Publish it with the Artifact tool (favicon on first publish) and give the user the link; it is the review surface for this gate.")
     return 0
 
 
@@ -334,8 +342,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=10, help="conversations per transcript segment")
     p.set_defaults(func=cmd_extract)
 
-    for name, func in (("check", cmd_check), ("summarize", cmd_summarize), ("approve", cmd_approve)):
-        p = sub.add_parser(name)
+    for name, func in (("check", cmd_check), ("summarize", cmd_summarize), ("render", cmd_render), ("approve", cmd_approve)):
+        p = sub.add_parser(name, help={"check": "validate the candidate", "summarize": "plain-text summary", "render": "interactive HTML page: graph, browse, evidence", "approve": "record the user's yes"}[name])
         p.add_argument("stage", choices=("ontology", "plan"))
         p.add_argument("workspace")
         if name == "check":

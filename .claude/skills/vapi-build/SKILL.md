@@ -66,28 +66,31 @@ $VB check ontology <ws>
 Fix every ERROR and re-run, up to five rounds; if still failing, show the user the remaining errors and ask how to proceed. Read the uncited-segment warning and either use those segments or list them under `uncovered` with a reason.
 
 ```bash
-$VB summarize ontology <ws>
+$VB render ontology <ws>        # writes <ws>/ontology/ontology.html
+$VB summarize ontology <ws>     # plain text, for your own reading
 ```
-**Gate 1.** Present the summary in plain language: what the domain contains, the caller goals and their phrases, key facts and rules, the API capabilities, open issues, coverage. Ask what is wrong or missing. Revise and re-check on request. On yes: `$VB approve ontology <ws>`.
+**Gate 1.** The deliverable is the rendered page, not a wall of text. Publish `<ws>/ontology/ontology.html` with the Artifact tool (title is already in the file; pass a favicon such as 🧭 on the first publish, and reuse the same file path on every republish so the link stays stable) and give the user the link. The page has a graph of goals, products, types, procedures, capabilities, and rules; a browse view for facts, observations, and issues; and a detail panel that opens on click and shows every record's evidence as the quoted source text. In chat, keep it to a few lines: the link, the two or three things worth their attention (conflicts, gaps, decisions the plan will need), and the question "what is wrong or missing?" Revise, re-check, re-render, and republish on request. On yes: `$VB approve ontology <ws>`.
 
 ## Plan
 Write `<ws>/plan/plan.json` per the plan guide, then:
 ```bash
 $VB check plan <ws>
+$VB render plan <ws>            # writes <ws>/plan/plan.html
 $VB summarize plan <ws>
 ```
-Fix errors the same way. **Gate 2.** Present the plan and read the check's "operations the agent will be able to call" list verbatim; it carries each operation's risk and whether the agent confirms before calling it. Ask which to keep. On yes: `$VB approve plan <ws>`.
+Fix errors the same way. **Gate 2.** Publish `<ws>/plan/plan.html` as an Artifact (favicon such as 🎧 on first publish; same path on republish) and give the link. Its graph shows assistants, jobs, goals, and tools; its Overview carries the runtime and the check's "operations the agent will be able to call" list, which you also read to the user verbatim in chat because it carries each operation's risk and whether the agent confirms before calling it. Ask which to keep. On yes: `$VB approve plan <ws>`.
 
 ## Build, test, hand over
 ```bash
 $VB compile <ws>
+$VB render plan <ws>            # the plan page now carries a Build section from vapi/build.json
 ```
-**Gate 3.** Show what will be created from `<ws>/vapi/summary.md`: knowledge files, tools with URLs and auth, assistants, squad. `compile` also reports which token variables are present in or missing from `~/.config/vapi-build/env`; copy any missing one with `$VB secrets set NAME --from-env NAME` (or `--from-file`) after asking the user where it lives, and confirm the Vapi key is in place (`$VB doctor`). On yes:
+**Gate 3.** Republish `<ws>/plan/plan.html` (same path, so the same link) and point the user at its Build tables: knowledge files, tools with URLs and auth, assistants, squad. `<ws>/vapi/summary.md` holds the same in text. `compile` also reports which token variables are present in or missing from `~/.config/vapi-build/env`; copy any missing one with `$VB secrets set NAME --from-env NAME` (or `--from-file`) after asking the user where it lives, and confirm the Vapi key is in place (`$VB doctor`). On yes:
 ```bash
 $VB apply <ws> --yes
 $VB test <ws>          # when the plan has tests
 ```
-Judge each chat transcript against its `expect` and `mustNot` lines and report a verdict per scenario with the agent's actual words. For failures that a prompt or plan change would fix, propose the change and, on yes, redo the chain: edit `plan.json`, `check plan`, `approve plan` (Gate 2 again), `compile`, `teardown --yes`, `apply --yes`. `apply` refuses a build compiled from an older plan, so the order matters. Finish with the resource IDs, how to talk to the agent in the Vapi dashboard, and the offer to remove everything with `$VB teardown <ws> --yes`.
+Judge each chat transcript against its `expect` and `mustNot` lines and report a verdict per scenario with the agent's actual words. For failures that a prompt or plan change would fix, propose the change and, on yes, redo the chain: edit `plan.json`, `check plan`, `approve plan` (Gate 2 again), `compile`, `teardown --yes`, `apply --yes`. `apply` refuses a build compiled from an older plan, so the order matters. After `apply`, run `$VB render plan <ws>` once more and republish so the page's Build section shows the applied resource IDs. Finish with the link, how to talk to the agent in the Vapi dashboard, and the offer to remove everything with `$VB teardown <ws> --yes`.
 
 ## Command reference
 | Command | Purpose |
@@ -96,5 +99,5 @@ Judge each chat transcript against its `expect` and `mustNot` lines and report a
 | `secrets find` / `secrets set NAME --from-env NAME` or `--from-file PATH --var NAME` `[--verify]` / `secrets list` / `secrets prompt NAME` | locate and copy keys and tokens into the key file without ever showing a value |
 | `init`, `add`, `fetch`, `extract` | workspace, sources, raw material, evidence ledger and packets |
 | `merge` | fold `ontology/fragments/*.json` into `ontology/ontology.json` |
-| `check`, `summarize`, `approve` (`ontology` or `plan`) | validate, explain, record the user's yes |
+| `check`, `render`, `summarize`, `approve` (`ontology` or `plan`) | validate, write the interactive HTML review page, plain-text summary, record the user's yes |
 | `compile`, `apply --yes`, `test`, `verify`, `status`, `teardown --yes` | build, create, exercise, read back, show, remove |

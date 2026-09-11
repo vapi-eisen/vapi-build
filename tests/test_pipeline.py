@@ -292,3 +292,20 @@ def test_re_extract_invalidates_ontology_approval(project):
     extract.extract_all(project, batch_size=2)
     with pytest.raises(BuildError, match="evidence changed"):
         ontology.approved_ontology(project)
+
+
+def test_render_ontology_and_plan_pages(project):
+    from vapi_build import render
+
+    write_ontology(project, valid_ontology(extract.load_ledger(project)))
+    assert ontology.check_ontology(project)["status"] == "CANDIDATE"
+    page = render.render_ontology(project).read_text()
+    assert page.startswith("<title>") and "cdnjs.cloudflare.com/ajax/libs/d3/" in page
+    assert "Get a refund" in page and "getSchedule" in page and '"evidence":{' in page
+    assert "</script" not in page.split('<script id="data"')[1].split("</script>")[0]  # embedded JSON cannot close the script early
+    ontology.approve_ontology(project, by="tester")
+    project.path("plan", "plan.json").write_text(json.dumps(valid_plan()))
+    assert plan.check_plan(project)["status"] == "CANDIDATE"
+    page = render.render_plan(project).read_text()
+    assert "Harbor Light Concierge" in page and "createBooking" in page and "enabledOperations" in page
+    assert project.path("plan", "plan.html").exists()
