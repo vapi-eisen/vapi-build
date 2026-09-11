@@ -87,7 +87,6 @@ def test_cli_secrets_commands(tmp_path, monkeypatch, capsys):
 
     key_file = tmp_path / "env"
     monkeypatch.setattr(vapi, "KEY_FILE", key_file)
-    monkeypatch.setattr(keyfile, "KEY_FILE", key_file)
     monkeypatch.setenv("SOURCE_KEY", "sk-from-shell")
     assert main(["secrets", "set", "VAPI_API_KEY", "--from-env", "SOURCE_KEY"]) == 0
     out = capsys.readouterr().out

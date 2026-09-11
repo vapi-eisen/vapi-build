@@ -83,9 +83,9 @@ class VapiClient:
 KEY_FILE = Path("~/.config/vapi-build/env")
 
 
-def load_env_file(path: Path = KEY_FILE) -> dict[str, str]:
+def load_env_file(path: Path | None = None) -> dict[str, str]:
     """Read KEY=value lines (optionally prefixed with `export`). Missing file → empty."""
-    path = path.expanduser()
+    path = (path or KEY_FILE).expanduser()
     if not path.exists():
         return {}
     values: dict[str, str] = {}
@@ -98,8 +98,10 @@ def load_env_file(path: Path = KEY_FILE) -> dict[str, str]:
     return values
 
 
-def find_key(env: dict[str, str] = os.environ, key_file: Path = KEY_FILE) -> tuple[str, str | None]:
+def find_key(env: dict[str, str] | None = None, key_file: Path | None = None) -> tuple[str, str | None]:
     """Return (key, where it came from). The key value is never logged by callers."""
+    env = os.environ if env is None else env
+    key_file = key_file or KEY_FILE
     for name in KEY_VARIABLES:
         if env.get(name):
             return env[name], f"environment variable {name}"
@@ -110,7 +112,9 @@ def find_key(env: dict[str, str] = os.environ, key_file: Path = KEY_FILE) -> tup
     return "", None
 
 
-def client_from_env(env: dict[str, str] = os.environ, *, transport: Transport = default_transport, key_file: Path = KEY_FILE) -> VapiClient:
+def client_from_env(env: dict[str, str] | None = None, *, transport: Transport = default_transport, key_file: Path | None = None) -> VapiClient:
+    env = os.environ if env is None else env
+    key_file = key_file or KEY_FILE
     key, source = find_key(env, key_file)
     if not key:
         raise BuildError(f"No Vapi private key found. Either export VAPI_API_KEY, or save a line `VAPI_API_KEY=<your private key>` in {key_file} "

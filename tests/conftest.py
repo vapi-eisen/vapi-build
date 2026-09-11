@@ -68,6 +68,16 @@ def nested_csv() -> bytes:
     return buffer.getvalue().encode()
 
 
+@pytest.fixture(autouse=True)
+def isolated_key_file(tmp_path: Path, monkeypatch):
+    """No test may read or write the real ~/.config/vapi-build/env."""
+    from vapi_build import vapi as vapi_module
+
+    monkeypatch.setattr(vapi_module, "KEY_FILE", tmp_path / "isolated-key-file" / "env")
+    monkeypatch.delenv("VAPI_API_KEY", raising=False)
+    monkeypatch.delenv("VAPI_PRIVATE_KEY", raising=False)
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Workspace:
     knowledge = tmp_path / "knowledge"

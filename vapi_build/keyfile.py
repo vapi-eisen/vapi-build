@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .vapi import KEY_FILE, KEY_VARIABLES, load_env_file
+from . import vapi as _vapi
+from .vapi import KEY_VARIABLES, load_env_file  # noqa: E402
 from .workspace import BuildError
 
 NAME = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
@@ -36,9 +37,9 @@ def _validate_value(value: str, name: str) -> str:
     return value
 
 
-def write_entries(updates: dict[str, str], key_file: Path = KEY_FILE) -> Path:
+def write_entries(updates: dict[str, str], key_file: Path | None = None) -> Path:
     """Merge updates into the key file, creating it with owner-only permissions. Existing lines survive."""
-    path = key_file.expanduser()
+    path = (key_file or _vapi.KEY_FILE).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     existing = load_env_file(path)
     merged = {**existing, **updates}
@@ -60,9 +61,10 @@ def read_from_login_shell(variable: str, shell: str | None = None) -> str:
     return completed.stdout.strip() if completed.returncode == 0 else ""
 
 
-def set_from_env(name: str, source: str, env: dict[str, str] = os.environ, key_file: Path = KEY_FILE, shell_reader=read_from_login_shell) -> dict[str, Any]:
+def set_from_env(name: str, source: str, env: dict[str, str] | None = None, key_file: Path | None = None, shell_reader=read_from_login_shell) -> dict[str, Any]:
     _validate_name(name)
     _validate_name(source)
+    env = os.environ if env is None else env
     value = env.get(source)
     origin = f"environment variable {source}"
     if not value:
@@ -74,7 +76,7 @@ def set_from_env(name: str, source: str, env: dict[str, str] = os.environ, key_f
     return {"name": name, "source": origin, "length": len(value.strip())}
 
 
-def set_from_file(name: str, path: str, variable: str | None = None, key_file: Path = KEY_FILE) -> dict[str, Any]:
+def set_from_file(name: str, path: str, variable: str | None = None, key_file: Path | None = None) -> dict[str, Any]:
     _validate_name(name)
     source = Path(path).expanduser()
     if not source.is_file():
@@ -96,7 +98,7 @@ def set_from_file(name: str, path: str, variable: str | None = None, key_file: P
     return {"name": name, "source": str(source), "length": len(value.strip())}
 
 
-def set_from_profile(name: str, alias: str, key_file: Path = KEY_FILE, profiles: Path = PROFILE_FILE, secrets: Path = PROFILE_SECRETS) -> dict[str, Any]:
+def set_from_profile(name: str, alias: str, key_file: Path | None = None, profiles: Path = PROFILE_FILE, secrets: Path = PROFILE_SECRETS) -> dict[str, Any]:
     """Reuse the Vapi GTM skill pack's profile convention: an alias naming the variable that holds the private key."""
     _validate_name(name)
     profiles_path = profiles.expanduser()
@@ -119,8 +121,9 @@ def set_from_profile(name: str, alias: str, key_file: Path = KEY_FILE, profiles:
     return {"name": name, "source": f"profile {alias} ({variable})", "length": len(value.strip())}
 
 
-def init_placeholders(names: list[str], key_file: Path = KEY_FILE) -> dict[str, Any]:
+def init_placeholders(names: list[str], key_file: Path | None = None) -> dict[str, Any]:
     """Create the file with empty lines for names not yet present, so the user can fill it in an editor."""
+    key_file = key_file or _vapi.KEY_FILE
     existing = load_env_file(key_file)
     missing = [_validate_name(n) for n in names if not existing.get(n)]
     path = key_file.expanduser()
@@ -136,7 +139,8 @@ def init_placeholders(names: list[str], key_file: Path = KEY_FILE) -> dict[str, 
     return {"path": str(path), "present": sorted(n for n in names if existing.get(n)), "placeholders": missing}
 
 
-def status(names: list[str] | None = None, key_file: Path = KEY_FILE) -> dict[str, Any]:
+def status(names: list[str] | None = None, key_file: Path | None = None) -> dict[str, Any]:
+    key_file = key_file or _vapi.KEY_FILE
     entries = load_env_file(key_file)
     wanted = names or sorted(set(entries) | set(KEY_VARIABLES[:1]))
     return {"path": str(key_file.expanduser()), "exists": key_file.expanduser().exists(),
@@ -195,7 +199,7 @@ def find_candidates(roots: list[Path] | None = None, *, profiles: tuple[str, ...
     return found
 
 
-def prompt_and_save(name: str, key_file: Path = KEY_FILE) -> dict[str, Any]:
+def prompt_and_save(name: str, key_file: Path | None = None) -> dict[str, Any]:
     """Interactive fallback for a terminal: hidden input, written straight to the key file."""
     _validate_name(name)
     if not sys.stdin.isatty():
