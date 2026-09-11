@@ -143,6 +143,13 @@ def cmd_compile(args) -> int:
     workspace = _workspace(args)
     build = compiler.compile_build(workspace)
     print(compiler.render_build_summary(build))
+    needed = sorted({header["env"] for tool in build["tools"] for header in tool.get("secretHeaders", [])})
+    if needed:
+        saved = vapi.load_env_file()
+        for name in needed:
+            print(f"  token {name}: {'present in' if saved.get(name) else 'MISSING from'} {vapi.KEY_FILE}")
+        if any(not saved.get(name) for name in needed):
+            print("  Ask the user to add the missing NAME=value line(s) to that file before `apply`.")
     print(f"Payloads: {workspace.path('vapi', 'build.json')}")
     return 0
 
@@ -183,8 +190,14 @@ def cmd_merge(args) -> int:
     return 0 if report["status"] == "MERGED" else 1
 
 
+def _require_applied(workspace: Workspace) -> None:
+    if not vapi.load_receipts(workspace):
+        raise BuildError("Nothing has been applied yet. Run `apply --yes` first.")
+
+
 def cmd_test(args) -> int:
     workspace = _workspace(args)
+    _require_applied(workspace)
     report = vapi.run_tests(workspace, vapi.client_from_env())
     if not report["results"]:
         print("The plan declares no tests; nothing to run. Talk to the assistant in the Vapi dashboard instead.")
@@ -196,6 +209,7 @@ def cmd_test(args) -> int:
 
 def cmd_verify(args) -> int:
     workspace = _workspace(args)
+    _require_applied(workspace)
     for line in vapi.verify(workspace, vapi.client_from_env()):
         print(f"  ok {line}")
     return 0
@@ -229,6 +243,7 @@ def cmd_status(args) -> int:
 
 def cmd_teardown(args) -> int:
     workspace = _workspace(args)
+    _require_applied(workspace)
     if not args.yes:
         print("teardown deletes every Vapi resource listed in vapi/receipts.json. Re-run with --yes after the user confirms.")
         return 1

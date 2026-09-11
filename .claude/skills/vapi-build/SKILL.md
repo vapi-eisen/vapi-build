@@ -74,7 +74,7 @@ Fix errors the same way. **Gate 2.** Present the plan and read the check's "oper
 ```bash
 $VB compile <ws>
 ```
-**Gate 3.** Show what will be created from `<ws>/vapi/summary.md`: knowledge files, tools with URLs and auth, assistants, squad, and any environment variable a bearer credential needs. Confirm the key file is in place (`$VB doctor`). On yes:
+**Gate 3.** Show what will be created from `<ws>/vapi/summary.md`: knowledge files, tools with URLs and auth, assistants, squad. `compile` also reports which token variables are present in or missing from `~/.config/vapi-build/env`; ask the user to add any missing line before continuing, and confirm the Vapi key is in place (`$VB doctor`). On yes:
 ```bash
 $VB apply <ws> --yes
 $VB test <ws>          # when the plan has tests

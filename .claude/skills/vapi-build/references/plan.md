@@ -23,7 +23,7 @@ The plan says what the agent does, with which knowledge and tools, and how it be
              "extract": {"sessionToken": "{{token}}"}},
             {"operationId": "getCustomer", "description": "Read the signed-in customer's profile.", "auth": {"mode": "NONE"}, "headers": {"Authorization": "Bearer {{sessionToken}}"}}],
   "knowledge": {"includeSourceDocuments": true, "includeWebsitePages": true, "includeDomainGuide": true, "excludeLocators": []},
-  "assistants": [{"id": "primary", "name": "Standard Charter Assistant", "systemPrompt": "…", "firstMessage": "Thanks for calling Standard Charter. How can I help?",
+  "assistants": [{"id": "primary", "name": "Standard Charter Assistant", "systemPrompt": "You are the Standard Charter Bank assistant. Help customers compare products, answer policy questions from the knowledge base, and prepare transfers only after verification and an explicit confirmation. Be concise and warm.", "firstMessage": "Thanks for calling Standard Charter. How can I help?",
                   "jobs": ["job:compare-products"], "tools": ["listOfferings", "prepareAction"], "knowledge": true}],
   "tests": [{"id": "test:compare", "scenario": "Product comparison", "callerOpening": "What savings accounts do you offer?", "expect": ["calls listOfferings", "names products from the result"], "mustNot": ["quotes a rate not in the result"]}],
   "exclusions": [{"what": "Investment advice", "why": "No authoritative source and out of policy."}]

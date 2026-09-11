@@ -18,5 +18,5 @@
 - URL variables (`{{bookingId}}`) resolve from the body properties the model fills; check the tool response in the call log if a path comes through unrendered.
 - Optional query parameters render as empty strings when the model omits them; if the API rejects `?q=`, remove the optional parameter from the plan's tool or ask for it as required.
 - Vapi indexes Markdown, text, PDF, and DOCX files. A file stuck in `indexing` past ten minutes stops `apply`; rerun to keep waiting, or remove that file from the plan.
-- 401 from the tool means the auth mode is wrong for that API: switch to `BEARER_ENV`/`VAPI_CREDENTIAL`, or model the login flow with `extract`.
+- 401 from the tool means the auth mode is wrong for that API: switch to `HEADER_ENV` or `VAPI_CREDENTIAL`, or model the login flow with `extract` and a Liquid `headers` value.
 - Assistant names must be unique in the Vapi organization when handoffs address them by name.
