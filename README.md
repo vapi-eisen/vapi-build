@@ -15,13 +15,7 @@ Sources are specified in the conversation, never checked into this repo. Project
 
 Say `/vapi-build` in any Claude Code session and name your material. The skill asks for what it needs (sources and their roles, transcript privacy, the API base URL, audience, auth), then does every step itself and stops only for three yes/no gates: the ontology, the plan with the exact operations the agent may call, and the build. It then creates the Vapi resources and runs the plan's test scenarios through Vapi chat.
 
-The one thing you do by hand, once: save your Vapi private key where the CLI reads it. Tokens for the APIs the agent calls go in the same file as extra `NAME=value` lines; the skill asks you for the names, never the values.
-
-```bash
-mkdir -p ~/.config/vapi-build && echo 'VAPI_API_KEY=<your private key>' > ~/.config/vapi-build/env && chmod 600 ~/.config/vapi-build/env
-```
-
-(Exporting `VAPI_API_KEY` in the shell you start Claude Code from also works.) S3 sources use your default AWS credentials or a profile you name.
+You never leave the conversation. The skill finds your Vapi private key where it already lives (an export in your shell profile, a `.env` file, or a Vapi GTM profile), asks which variable to use, and copies it into `~/.config/vapi-build/env` with `vapi-build secrets set`, verifying it with one read-only call. Values are never printed or pasted into chat. Tokens for the APIs the agent calls are copied the same way. If a key is on no file on your machine, the fallback is a hidden prompt in the Claude app's Terminal tab. S3 sources use your default AWS credentials or a profile you name.
 
 The skill is installed for all sessions by symlinking its folder into `~/.claude/skills/vapi-build`; it ships a launcher, `vapi-build`, that runs the CLI from any directory. Inside this repo the same skill is available project-locally.
 

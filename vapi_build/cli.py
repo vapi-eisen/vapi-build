@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, compile as compiler, extract, ontology, plan, sources, vapi
+from . import __version__, compile as compiler, extract, keyfile, ontology, plan, sources, vapi
 from .workspace import BuildError, Workspace, read_json
 
 DEFAULT_ROOT = "~/vapi-build-projects"
@@ -26,7 +26,7 @@ def cmd_doctor(args) -> int:
         except ImportError:
             print(f"  MISSING {module}  (pip install {'pyyaml' if module == 'yaml' else module}){'; only needed for s3:// sources' if module == 'boto3' else ''}")
     _, source = vapi.find_key()
-    print(f"  {'ok  ' if source else 'unset'} Vapi private key" + (f" from {source}" if source else f" (export VAPI_API_KEY or save VAPI_API_KEY=… in {vapi.KEY_FILE}; needed only for apply/test/teardown)"))
+    print(f"  {'ok  ' if source else 'unset'} Vapi private key" + (f" from {source}" if source else " (run `secrets find`, then `secrets set VAPI_API_KEY --from-env NAME --verify` or `--from-file PATH --var NAME`; needed only for apply/test/teardown)"))
     aws = any(os.environ.get(k) for k in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID")) or Path("~/.aws/credentials").expanduser().exists() or Path("~/.aws/config").expanduser().exists()
     print(f"  {'ok  ' if aws else 'unset'} AWS credentials (needed only for s3:// sources)")
     return 0
@@ -207,6 +207,51 @@ def cmd_test(args) -> int:
     return 0
 
 
+def cmd_secrets(args) -> int:
+    if args.action == "set":
+        if args.from_env:
+            result = keyfile.set_from_env(args.name, args.from_env)
+        elif args.from_file:
+            result = keyfile.set_from_file(args.name, args.from_file, args.var)
+        elif args.from_profile:
+            result = keyfile.set_from_profile(args.name, args.from_profile)
+        else:
+            raise BuildError("Say where to copy the value from: --from-env NAME, --from-file PATH [--var NAME], or --from-profile ALIAS.")
+        print(f"Saved {result['name']} ({result['length']} characters) from {result['source']} into {vapi.KEY_FILE}.")
+        if args.verify and args.name in vapi.KEY_VARIABLES:
+            check = keyfile.verify_key(vapi.client_from_env())
+            print("Verified with Vapi: key works" + (f", organization {check['orgId']}" if check.get("orgId") else "") + ".")
+        return 0
+    if args.action == "init":
+        result = keyfile.init_placeholders(args.names or ["VAPI_API_KEY"])
+        print(f"{result['path']}: present {', '.join(result['present']) or 'none'}; placeholders added for {', '.join(result['placeholders']) or 'none'}.")
+        if result["placeholders"]:
+            print("Ask the user to open that file and paste each value after its `=`; never paste values into the chat.")
+        return 0
+    if args.action == "find":
+        candidates = keyfile.find_candidates()
+        if not candidates:
+            print("No file or shell profile on this machine declares a VAPI_* key or token.")
+            print(f"Fallback: in the Terminal tab of the Claude app, run `{Path.home() / '.claude/skills/vapi-build/vapi-build'} secrets prompt VAPI_API_KEY` and paste the key at the hidden prompt.")
+            return 1
+        for candidate in candidates:
+            hint = "--from-env NAME" if candidate["kind"] == "shell profile" else f"--from-file {candidate['path']} --var NAME"
+            print(f"  {candidate['path']}: {', '.join(candidate['variables'])}  [{candidate['kind']}] → secrets set VAPI_API_KEY {hint} --verify")
+        print("Ask the user which variable holds the private key (not the public key), then run the matching command.")
+        return 0
+    if args.action == "prompt":
+        result = keyfile.prompt_and_save(args.name)
+        print(f"Saved {result['name']} ({result['length']} characters) from a hidden prompt into {vapi.KEY_FILE}.")
+        return 0
+    if args.action == "verify":
+        check = keyfile.verify_key(vapi.client_from_env())
+        print("Vapi key works" + (f"; organization {check['orgId']}" if check.get("orgId") else "") + f"; {check['assistantsVisible']} assistant(s) visible in the first page.")
+        return 0
+    result = keyfile.status(args.names or None)
+    print(f"{result['path']} ({'exists' if result['exists'] else 'missing'}): present {', '.join(result['present']) or 'none'}; missing {', '.join(result['missing']) or 'none'}.")
+    return 0
+
+
 def cmd_verify(args) -> int:
     workspace = _workspace(args)
     _require_applied(workspace)
@@ -298,6 +343,30 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "approve":
             p.add_argument("--by", help="who approved (defaults to git user.email)")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("secrets", help="copy the Vapi key or a tool token into ~/.config/vapi-build/env without showing it")
+    actions = p.add_subparsers(dest="action", required=True)
+    a = actions.add_parser("set", help="copy one value from an environment variable, a file, or a Vapi GTM profile")
+    a.add_argument("name", help="variable name to save, e.g. VAPI_API_KEY or SC_SERVICE_TOKEN")
+    a.add_argument("--from-env", metavar="NAME", help="environment variable that holds the value")
+    a.add_argument("--from-file", metavar="PATH", help="a NAME=value file or a single-line secret file")
+    a.add_argument("--var", metavar="NAME", help="with --from-file: the variable to copy when the file holds several")
+    a.add_argument("--from-profile", metavar="ALIAS", help="~/.config/agent-strategist/vapi-profiles.yaml alias")
+    a.add_argument("--verify", action="store_true", help="after saving a Vapi key, make one read-only call to confirm it works")
+    a.set_defaults(func=cmd_secrets)
+    a = actions.add_parser("init", help="create the file with empty lines for the given names")
+    a.add_argument("names", nargs="*")
+    a.set_defaults(func=cmd_secrets)
+    a = actions.add_parser("list", help="which names are present or missing (never values)")
+    a.add_argument("names", nargs="*")
+    a.set_defaults(func=cmd_secrets)
+    a = actions.add_parser("verify", help="confirm the saved Vapi key works with one read-only call")
+    a.set_defaults(func=cmd_secrets)
+    a = actions.add_parser("find", help="list files and shell profiles on this machine that declare a VAPI_* key (names only)")
+    a.set_defaults(func=cmd_secrets)
+    a = actions.add_parser("prompt", help="interactive: paste a value at a hidden terminal prompt and save it")
+    a.add_argument("name")
+    a.set_defaults(func=cmd_secrets)
 
     p = sub.add_parser("merge", help="combine ontology/fragments/*.json into ontology/ontology.json")
     p.add_argument("workspace")
