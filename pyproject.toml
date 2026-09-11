@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vapi-build"
+version = "0.1.0"
+description = "Claude Code skill and CLI: raw source material → evidence-linked ontology → agent plan → live Vapi agent"
+requires-python = ">=3.11"
+dependencies = ["jsonschema>=4.18", "PyYAML>=6.0", "boto3>=1.34"]
+
+[project.scripts]
+vapi-build = "vapi_build.cli:main"
+
+[tool.setuptools]
+packages = ["vapi_build"]
+
+[tool.setuptools.package-data]
+vapi_build = ["schemas/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py311"

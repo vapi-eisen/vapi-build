@@ -1,0 +1,248 @@
+"""Create, verify, and remove the Vapi resources described by vapi/build.json.
+
+Every created ID is written to vapi/receipts.json immediately, so an interrupted apply can
+resume and a teardown can always find what it owns. The API key comes from the environment
+and is never written to disk or printed.
+"""
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import time
+import uuid
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from .workspace import BuildError, Workspace, read_json, utc_now, write_json
+
+Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, bytes]]
+KEY_VARIABLES = ("VAPI_API_KEY", "VAPI_PRIVATE_KEY")
+
+
+def default_transport(method: str, url: str, headers: dict[str, str], data: bytes | None) -> tuple[int, bytes]:
+    request = Request(url, data=data, method=method, headers=headers)
+    try:
+        with urlopen(request, timeout=60) as response:  # noqa: S310 - fixed Vapi API host
+            return response.status, response.read()
+    except HTTPError as error:
+        return error.code, error.read()
+    except URLError as error:
+        raise BuildError(f"Could not reach {url}: {error.reason}") from error
+
+
+class VapiClient:
+    def __init__(self, api_key: str, *, base_url: str = "https://api.vapi.ai", transport: Transport = default_transport) -> None:
+        if not api_key:
+            raise BuildError("Set VAPI_API_KEY (your Vapi private key) in the environment before applying.")
+        self._key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.transport = transport
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, method: str, path: str, body: Any = None, *, allow_404: bool = False) -> Any:
+        headers = {"Authorization": f"Bearer {self._key}", "Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        status, raw = self.transport(method, self.base_url + path, headers, data)
+        self.calls.append((method, path))
+        return self._decode(method, path, status, raw, allow_404)
+
+    def upload(self, name: str, data: bytes, *, purpose: str = "knowledge-base-v2", metadata: dict[str, Any] | None = None) -> Any:
+        boundary = f"----vapi-build-{uuid.uuid4().hex}"
+        content_type = mimetypes.guess_type(name)[0] or ("text/markdown" if name.endswith(".md") else "application/octet-stream")
+        parts = [f"--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{purpose}\r\n".encode()]
+        if metadata:
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{json.dumps(metadata)}\r\n".encode())
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: {content_type}\r\n\r\n".encode() + data + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        headers = {"Authorization": f"Bearer {self._key}", "Accept": "application/json", "Content-Type": f"multipart/form-data; boundary={boundary}"}
+        status, raw = self.transport("POST", self.base_url + "/file", headers, b"".join(parts))
+        self.calls.append(("POST", "/file"))
+        return self._decode("POST", "/file", status, raw, False)
+
+    @staticmethod
+    def _decode(method: str, path: str, status: int, raw: bytes, allow_404: bool) -> Any:
+        if status == 404 and allow_404:
+            return None
+        if status >= 400:
+            detail = raw.decode("utf-8", errors="replace")[:400]
+            raise BuildError(f"Vapi {method} {path} failed with HTTP {status}: {detail}")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            return raw.decode("utf-8", errors="replace")
+
+
+def client_from_env(env: dict[str, str] = os.environ, *, transport: Transport = default_transport) -> VapiClient:
+    key = next((env[name] for name in KEY_VARIABLES if env.get(name)), "")
+    return VapiClient(key, base_url=env.get("VAPI_BASE_URL", "https://api.vapi.ai"), transport=transport)
+
+
+def load_build(workspace: Workspace) -> dict[str, Any]:
+    path = workspace.path("vapi", "build.json")
+    if not path.exists():
+        raise BuildError("No compiled build. Run `compile` first.")
+    return read_json(path)
+
+
+def load_receipts(workspace: Workspace) -> dict[str, Any] | None:
+    path = workspace.path("vapi", "receipts.json")
+    return read_json(path) if path.exists() else None
+
+
+def _save(workspace: Workspace, receipts: dict[str, Any]) -> None:
+    receipts["updatedAt"] = utc_now()
+    write_json(workspace.path("vapi", "receipts.json"), receipts)
+
+
+def apply(workspace: Workspace, client: VapiClient, *, env: dict[str, str] = os.environ, sleep: Callable[[float], None] = time.sleep,
+          poll_seconds: float = 5.0, timeout_seconds: float = 600.0) -> dict[str, Any]:
+    build = load_build(workspace)
+    receipts = load_receipts(workspace) or {"planDigest": build["planDigest"], "startedAt": utc_now(), "credentials": {}, "files": {}, "knowledgeBase": {}, "tools": {}, "assistants": {}, "squad": {}, "verified": False}
+    if receipts["planDigest"] != build["planDigest"]:
+        raise BuildError("Receipts belong to a different build. Run `teardown` before applying a new plan, or delete vapi/receipts.json if those resources are already gone.")
+
+    for credential in build["credentials"]:
+        if credential["ref"] in receipts["credentials"]:
+            continue
+        token = env.get(credential["env"])
+        if not token:
+            raise BuildError(f"Environment variable {credential['env']} is not set; it must hold the bearer token for the API.")
+        created = client.request("POST", "/credential", {"provider": "custom-credential", "name": credential["name"],
+                                                         "authenticationPlan": {"type": "bearer", "token": token, "headerName": credential["headerName"]}})
+        receipts["credentials"][credential["ref"]] = created["id"]
+        _save(workspace, receipts)
+
+    for file in build["knowledgeBase"]["files"]:
+        if file["path"] in receipts["files"]:
+            continue
+        data = workspace.path("vapi", file["path"]).read_bytes()
+        created = client.upload(file["name"], data, metadata={"managedBy": "vapi-build", "project": build["projectSlug"], "origin": file["origin"]})
+        if not created or not created.get("id") or created.get("status") == "failed":
+            raise BuildError(f"Vapi did not accept {file['name']}.")
+        receipts["files"][file["path"]] = created["id"]
+        _save(workspace, receipts)
+
+    if not receipts["knowledgeBase"].get("id"):
+        created = client.request("POST", "/v2/knowledge-base", {"name": build["knowledgeBase"]["name"], "description": build["knowledgeBase"]["description"]})
+        receipts["knowledgeBase"] = {"id": created["id"], "attached": [], "toolId": created.get("toolId")}
+        _save(workspace, receipts)
+    knowledge_base_id = receipts["knowledgeBase"]["id"]
+    for path, file_id in receipts["files"].items():
+        if file_id in receipts["knowledgeBase"]["attached"]:
+            continue
+        client.request("POST", f"/v2/knowledge-base/{knowledge_base_id}/file", {"fileId": file_id})
+        receipts["knowledgeBase"]["attached"].append(file_id)
+        _save(workspace, receipts)
+    if not receipts["knowledgeBase"].get("toolId"):
+        receipts["knowledgeBase"]["toolId"] = _wait_for_knowledge(client, knowledge_base_id, list(receipts["files"].values()), sleep, poll_seconds, timeout_seconds)
+        _save(workspace, receipts)
+
+    for tool in build["tools"]:
+        if tool["ref"] in receipts["tools"]:
+            continue
+        payload = dict(tool["payload"])
+        if tool["credentialRef"]:
+            payload["credentialId"] = receipts["credentials"][tool["credentialRef"]]
+        created = client.request("POST", "/tool", payload)
+        receipts["tools"][tool["ref"]] = created["id"]
+        _save(workspace, receipts)
+
+    for assistant in build["assistants"]:
+        if assistant["ref"] in receipts["assistants"]:
+            continue
+        payload = json.loads(json.dumps(assistant["payload"]))
+        tool_ids = [receipts["tools"][ref] for ref in assistant["toolRefs"]]
+        if assistant["knowledge"]:
+            tool_ids.insert(0, receipts["knowledgeBase"]["toolId"])
+        if tool_ids:
+            payload["model"]["toolIds"] = tool_ids
+        created = client.request("POST", "/assistant", payload)
+        receipts["assistants"][assistant["ref"]] = created["id"]
+        _save(workspace, receipts)
+
+    if build["squad"] and not receipts["squad"].get("id"):
+        members = [{"assistantId": receipts["assistants"][member["assistantRef"]], "assistantDestinations": member["assistantDestinations"]} for member in build["squad"]["members"]]
+        created = client.request("POST", "/squad", {**build["squad"]["payload"], "members": members})
+        receipts["squad"] = {"id": created["id"]}
+        _save(workspace, receipts)
+
+    verify(workspace, client, receipts)
+    receipts["verified"] = True
+    receipts["appliedAt"] = utc_now()
+    _save(workspace, receipts)
+    return receipts
+
+
+def _wait_for_knowledge(client: VapiClient, knowledge_base_id: str, file_ids: list[str], sleep: Callable[[float], None], poll_seconds: float, timeout_seconds: float) -> str:
+    waited = 0.0
+    while True:
+        knowledge = client.request("GET", f"/v2/knowledge-base/{knowledge_base_id}") or {}
+        files = knowledge.get("files")
+        if files is None:
+            files = client.request("GET", f"/v2/knowledge-base/{knowledge_base_id}/file") or []
+        relevant = [f for f in files if f.get("fileId") in file_ids]
+        failed = [f for f in relevant if f.get("status") == "failed"]
+        if failed:
+            raise BuildError(f"{len(failed)} knowledge file(s) failed to index in Vapi: {', '.join(f.get('fileName') or f.get('fileId') for f in failed)}")
+        ready = len(relevant) == len(file_ids) and all(f.get("status") == "ready" for f in relevant)
+        tool_id = knowledge.get("toolId")
+        if ready and not tool_id:
+            tool_id = next((t["id"] for t in (client.request("GET", "/tool?limit=1000") or []) if t.get("type") == "knowledgeBase" and t.get("knowledgeBaseId") == knowledge_base_id), None)
+        if ready and tool_id:
+            return tool_id
+        if waited >= timeout_seconds:
+            raise BuildError("The knowledge base did not finish indexing in time. Re-run `apply` to keep waiting; nothing is duplicated.")
+        sleep(poll_seconds)
+        waited += poll_seconds
+
+
+def verify(workspace: Workspace, client: VapiClient, receipts: dict[str, Any] | None = None) -> list[str]:
+    receipts = receipts or load_receipts(workspace)
+    if not receipts:
+        raise BuildError("Nothing has been applied yet.")
+    checks = [("squad", receipts["squad"].get("id"))] if receipts.get("squad", {}).get("id") else []
+    checks += [("assistant", i) for i in receipts["assistants"].values()] + [("tool", i) for i in receipts["tools"].values()]
+    if receipts["knowledgeBase"].get("id"):
+        checks.append(("v2/knowledge-base", receipts["knowledgeBase"]["id"]))
+    seen = []
+    for kind, identifier in checks:
+        resource = client.request("GET", f"/{kind}/{identifier}")
+        if not resource or resource.get("id") != identifier:
+            raise BuildError(f"Vapi returned the wrong {kind} for {identifier}.")
+        seen.append(f"{kind} {identifier}")
+    return seen
+
+
+def teardown(workspace: Workspace, client: VapiClient) -> list[str]:
+    receipts = load_receipts(workspace)
+    if not receipts:
+        raise BuildError("No receipts; nothing to remove.")
+    removed = []
+
+    def remove(kind: str, identifier: str) -> None:
+        client.request("DELETE", f"/{kind}/{identifier}", allow_404=True)
+        removed.append(f"{kind} {identifier}")
+        _save(workspace, receipts)
+
+    if receipts["squad"].get("id"):
+        remove("squad", receipts["squad"].pop("id"))
+    for ref in list(receipts["assistants"]):
+        remove("assistant", receipts["assistants"].pop(ref))
+    for ref in list(receipts["tools"]):
+        remove("tool", receipts["tools"].pop(ref))
+    if receipts["knowledgeBase"].get("id"):
+        remove("v2/knowledge-base", receipts["knowledgeBase"]["id"])
+        receipts["knowledgeBase"] = {}
+    for path in list(receipts["files"]):
+        remove("file", receipts["files"].pop(path))
+    for ref in list(receipts["credentials"]):
+        remove("credential", receipts["credentials"].pop(ref))
+    workspace.path("vapi", "receipts.json").unlink(missing_ok=True)
+    return removed
