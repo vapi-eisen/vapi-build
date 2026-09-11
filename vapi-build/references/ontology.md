@@ -21,7 +21,7 @@ Work packet by packet. For large corpora, keep `ontology/notes.md` with candidat
 | `procedures` | ordered steps with optional branching | `id`, `label`, `steps[]` (`id`, `instruction`, optional `capability`, `next`), `evidence`; optional `goals` |
 | `goals` | what callers want, independent of how | `id`, `label`, `definition`, `evidence`; optional `callerPhrases` |
 | `capabilities` | one entry per OpenAPI operation you want in the ontology | `id` from `evidence/capabilities.json`; optional `alignedGoals`, `preconditions`, `notes` |
-| `observations` | what the transcripts show: demand, vocabulary, outcomes | `id`, `text`, `evidence`; optional `goals`, `count`, `sampleSize` |
+| `observations` | what the transcripts and IVR logs show: demand, vocabulary, outcomes, what an existing IVR failed to recognize | `id`, `text`, `evidence`; optional `goals`, `count`, `sampleSize` |
 | `issues` | conflicts, ambiguity, missing evidence, gaps | `id`, `kind`, `severity`, `description`; optional `records`, `evidence` |
 | `uncovered` (optional) | segments you deliberately did not use | `segment`, `reason` |
 

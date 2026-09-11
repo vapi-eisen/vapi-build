@@ -397,7 +397,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("role", choices=sources.ROLES)
     p.add_argument("location", help="https URL, local file or directory, or s3://bucket/prefix")
     p.add_argument("--authority", choices=("AUTHORITATIVE", "SUPPORTING"), help="knowledge/website only")
-    p.add_argument("--privacy", choices=sources.PRIVACY, help="transcripts only: synthetic, redacted, or raw (raw is never shown to the model)")
+    p.add_argument("--privacy", choices=sources.PRIVACY, help="transcripts (call transcripts or speech IVR logs) only: synthetic, redacted, or raw (raw is never shown to the model)")
     p.add_argument("--max-pages", type=int, default=40, help="website crawl limit")
     p.add_argument("--allowed-host", action="append", help="extra hostnames the website crawl may follow")
     p.add_argument("--sample", type=int, default=40, help="transcripts: conversations to sample")

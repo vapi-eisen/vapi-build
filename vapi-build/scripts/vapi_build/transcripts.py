@@ -3,7 +3,11 @@
 Supported shapes: a CSV with one conversation per row (including a nested-CSV transcript
 column), a CSV of utterance rows grouped by a conversation id, JSON or JSONL objects with a
 turns/messages/utterances array or a transcript string, and plain text files (one
-conversation each). Large CSV objects are streamed up to a byte budget and sampled with a
+conversation each). Speech IVR logs arrive as the second shape without a speaker column: one
+recognized caller utterance per row with the prompt or menu it answered and the recognition
+result. They are grouped by call, every row is the caller, and the prompt and a no-match or
+no-input result are kept in the turn text, so what callers said to the IVR (and what it failed
+to understand) becomes observation and simulation material like any other transcript. Large CSV objects are streamed up to a byte budget and sampled with a
 seeded reservoir, so a multi-gigabyte corpus costs a bounded download.
 """
 from __future__ import annotations
@@ -20,8 +24,14 @@ from typing import Any, Callable, Iterable, Iterator
 from .workspace import BuildError
 
 SPEAKER_COLUMNS = ("speaker", "role", "party", "speaker_role", "speaker_name", "from")
-TEXT_COLUMNS = ("text", "content", "utterance", "message", "transcript", "body")
-ID_COLUMNS = ("conversation_id", "call_id", "conversationid", "callid", "session_id", "id", "transcript_id")
+TEXT_COLUMNS = ("text", "content", "utterance", "message", "transcript", "body",
+                # speech IVR recognition logs
+                "asr_text", "recognized_text", "recognition_text", "recognized_utterance", "transcription", "caller_said", "input_text", "user_input")
+ID_COLUMNS = ("conversation_id", "call_id", "conversationid", "callid", "session_id", "id", "transcript_id", "interaction_id", "call_uuid", "ucid")
+# IVR-only columns: which prompt or menu the caller was answering, and whether the recognizer understood them.
+PROMPT_COLUMNS = ("prompt", "prompt_name", "menu", "menu_name", "state", "dialog_state", "node", "step", "grammar", "application_state")
+RESULT_COLUMNS = ("result", "recognition_result", "recognition_status", "reco_result", "outcome", "status", "event")
+NOT_RECOGNIZED = re.compile(r"no.?match|no.?input|no.?reco|reject|fail|timeout|silence|max.?(retries|attempts)", re.IGNORECASE)
 csv.field_size_limit(64 * 1024 * 1024)
 
 Conversation = dict[str, Any]
@@ -75,13 +85,25 @@ def _nested_csv_column(row: dict[str, str]) -> str | None:
     return None
 
 
-def _turns_from_rows(rows: list[dict[str, str]], speaker_col: str | None, text_col: str) -> list[dict[str, str]]:
+def _turns_from_rows(rows: list[dict[str, str]], speaker_col: str | None, text_col: str, *, prompt_col: str | None = None, result_col: str | None = None,
+                     default_speaker: str = "unknown") -> list[dict[str, str]]:
     turns = []
     for row in rows:
+        result = (row.get(result_col) or "").strip() if result_col else ""
+        if prompt_col or result_col:
+            # IVR rows: keep the prompt the caller answered and flag what the recognizer rejected; a no-input row is a silent turn.
+            text = (row.get(text_col) or "").strip()
+            if not text and result and NOT_RECOGNIZED.search(result):
+                text = "(no speech)"
+            if text:
+                prompt = (row.get(prompt_col) or "").strip() if prompt_col else ""
+                flag = f" (IVR result: {result})" if result and NOT_RECOGNIZED.search(result) else ""
+                turns.append({"speaker": (row.get(speaker_col) or default_speaker).strip() if speaker_col else default_speaker, "text": f"[{prompt}] {text}{flag}" if prompt else f"{text}{flag}"})
+            continue
         text = (row.get(text_col) or "").strip()
         if not text:
             continue
-        turns.append({"speaker": (row.get(speaker_col) or "unknown").strip() if speaker_col else "unknown", "text": text})
+        turns.append({"speaker": (row.get(speaker_col) or default_speaker).strip() if speaker_col else default_speaker, "text": text})
     return turns
 
 
@@ -135,19 +157,29 @@ def conversations_from_csv(lines: Iterable[str], locator: str) -> Iterator[Conve
     speaker_col = _pick(header, ROLE_SPEAKERS) or (_pick(header, ("from",)) if not _pick(header, ("to",)) else None)
     text_col, id_col = _pick(header, TEXT_COLUMNS), _pick(header, ID_COLUMNS)
     single_line_text = bool(text_col and "\n" not in (first.get(text_col) or ""))
-    if nested is None and text_col and id_col and speaker_col and single_line_text:
+    prompt_col, result_col = _pick(header, PROMPT_COLUMNS), _pick(header, RESULT_COLUMNS)
+    ivr = nested is None and text_col and id_col and not speaker_col and (prompt_col or result_col)
+    if nested is None and text_col and id_col and (speaker_col or ivr) and single_line_text:
+        skip = {text_col, speaker_col, id_col, prompt_col, result_col}
+
+        def conversation(current_id: str, buffered: list[dict[str, str]]) -> Conversation:
+            turns = _turns_from_rows(buffered, speaker_col, text_col, prompt_col=prompt_col if ivr else None, result_col=result_col if ivr else None,
+                                     default_speaker="caller" if ivr else "unknown")
+            fields = {k: v for k, v in buffered[0].items() if k not in skip and isinstance(v, str) and v and len(v) <= 200} if len(buffered) == 1 or ivr else {}
+            return {"id": current_id, "locator": locator, "turns": turns, "fields": fields}
+
         def grouped() -> Iterator[Conversation]:
             current_id, buffered = None, []
             for row in all_rows:
                 row_id = row.get(id_col) or ""
                 if current_id is not None and row_id != current_id and buffered:
-                    yield {"id": current_id, "locator": locator, "turns": _turns_from_rows(buffered, speaker_col, text_col), "fields": {}}
+                    yield conversation(current_id, buffered)
                     buffered = []
                 current_id = row_id
                 buffered.append(row)
             if buffered and current_id is not None:
-                yield {"id": current_id, "locator": locator, "turns": _turns_from_rows(buffered, speaker_col, text_col), "fields": {}}
-        yield from _complete_only(grouped(), lines)
+                yield conversation(current_id, buffered)
+        yield from _complete_only((c for c in grouped() if c["turns"]), lines)
         return
 
     def per_row() -> Iterator[Conversation]:

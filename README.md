@@ -4,7 +4,8 @@ An [Agent Skill](https://agentskills.io/specification) for [Vapi](https://vapi.a
 
 - a public **website** (crawled within its host),
 - **knowledge** articles from local files, URLs, or S3 (Markdown, text, YAML, JSON, HTML; PDF and DOCX are uploaded to the knowledge base as-is),
-- sampled **call transcripts** from local files, URLs, or S3 (CSV including nested-transcript columns, JSON/JSONL, text), and
+- sampled **call transcripts** from local files, URLs, or S3 (CSV including nested-transcript columns, JSON/JSONL, text),
+- **speech IVR logs** from an existing IVR (one recognized utterance per row with call id, prompt, and result), read through the same transcripts role so no-match utterances become goals, observations, and simulation scenarios, and
 - an **OpenAPI** document describing what the agent may do, with the live backend URL you choose.
 
 The AI agent running the skill is the ontologist and planner. A small Python CLI shipped inside the skill is the deterministic host: it fetches and pins the sources, verifies everything the agent writes against the evidence, renders one review page, and creates the Vapi resources. The result is an evidence-linked ontology, a reviewed plan (a single assistant or a squad with a front-door authenticator, structured outputs for every call, a simulation suite), a knowledge base, API Request tools for approved operations, and the applied assistants, squad, structured outputs, and simulations.
@@ -55,7 +56,7 @@ Every evidence ID the agent cites is an exact character span in a pinned segment
 
 ## Safety defaults
 
-- Transcripts require a privacy attestation (`synthetic`, `redacted`, or `raw`); raw transcripts are never shown to the model or uploaded. A pattern scan reports emails, phone numbers, card-like and SSN-like strings.
+- Transcripts and IVR logs require a privacy attestation (`synthetic`, `redacted`, or `raw`); raw transcripts are never shown to the model or uploaded. A pattern scan reports emails, phone numbers, card-like and SSN-like strings.
 - Every OpenAPI operation starts disabled. Administrative operations are refused unless explicitly allowed; every non-read operation must be marked `confirmBeforeCall`, which the compiled prompt turns into a read-back and explicit confirmation, unless the plan states a reason to skip it (a login or PIN check) and the user sees that on the review page.
 - API keys and tokens are read from the environment or `~/.config/vapi-build/env` at apply time, injected into request headers only in the live request, and never written into build files, receipts, or output. A plan cannot name a platform secret, and a token equal to the Vapi key is refused.
 - Simulations never reach a live write: the checker requires a mock for every write tool a scenario can reach, and running the suite needs an explicit yes because it uses credits.

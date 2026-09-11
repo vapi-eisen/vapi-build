@@ -195,3 +195,24 @@ def test_raw_transcripts_are_never_written_to_disk(tmp_path):
     assert inventory["privacy"] == "raw" and "conversations" not in inventory and inventory["piiScan"]["conversationsScanned"] == 3
     assert not (raw_dir / "conversations.json").exists()
     assert "money back" not in "".join(p.read_text() for p in raw_dir.glob("*.json"))
+
+
+def test_speech_ivr_logs_group_by_call_and_keep_prompt_and_no_match():
+    rows = ("call_id,timestamp,prompt_name,asr_text,recognition_result,confidence\n"
+            "c1,2025-01-03T10:00:00,MainMenu,I want to cancel my crossing,MATCH,0.91\n"
+            "c1,2025-01-03T10:00:09,RefundReason,the weather looks awful tomorrow,NOMATCH,0.22\n"
+            "c1,2025-01-03T10:00:20,RefundReason,,NOINPUT,\n"
+            "c2,2025-01-04T08:12:00,MainMenu,when is the last boat back,MATCH,0.88\n")
+    conversations = list(transcripts.conversations_from_csv(io.StringIO(rows), "ivr.csv"))
+    assert [c["id"] for c in conversations] == ["c1", "c2"]
+    first = conversations[0]["turns"]
+    assert first[0] == {"speaker": "caller", "text": "[MainMenu] I want to cancel my crossing"}
+    assert first[1] == {"speaker": "caller", "text": "[RefundReason] the weather looks awful tomorrow (IVR result: NOMATCH)"}
+    assert first[2] == {"speaker": "caller", "text": "[RefundReason] (no speech) (IVR result: NOINPUT)"}
+    assert conversations[0]["fields"]["timestamp"].startswith("2025-01-03") and "asr_text" not in conversations[0]["fields"]
+    text = transcripts.conversation_text(conversations[0])
+    assert "NOMATCH" in text and "0.91" not in text, "confidence stays in fields; the model sees what callers said and what the IVR missed"
+    # a plain one-row-per-conversation CSV with an id and a text column still yields one conversation per row with its fields
+    plain = "id,reason,transcript\n1,Refund,Customer said hi\n2,Schedule,Customer asked times\n"
+    plain_conversations = list(transcripts.conversations_from_csv(io.StringIO(plain), "plain.csv"))
+    assert [c["fields"]["reason"] for c in plain_conversations] == ["Refund", "Schedule"]
