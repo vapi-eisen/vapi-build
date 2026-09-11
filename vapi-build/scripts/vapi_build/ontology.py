@@ -304,6 +304,25 @@ def approve_ontology(workspace: Workspace, *, by: str | None = None) -> dict[str
     return approval
 
 
+def checked_ontology(workspace: Workspace) -> dict[str, Any]:
+    """The ontology candidate as last checked, whether or not it has been approved yet.
+
+    Planning starts from here: the plan and the ontology are reviewed together on one page, and
+    `approve plan` records both approvals. A critical open issue still blocks approval."""
+    report_path = workspace.path("ontology", "check.json")
+    if not report_path.exists():
+        raise BuildError("Run `check ontology` before writing the plan.")
+    report = read_json(report_path)
+    if report["status"] not in {"CANDIDATE", "BLOCKED_BY_CRITICAL_ISSUES"}:
+        raise BuildError(f"The ontology check status is {report['status']}; fix its errors before planning.")
+    candidate = load_candidate(workspace)
+    if candidate.get("digest") != report["digest"] or ontology_digest(candidate) != candidate.get("digest"):
+        raise BuildError("The ontology candidate changed after its last check. Run `check ontology` again.")
+    if candidate.get("ledgerDigest") != ledger_digest(load_ledger(workspace)):
+        raise BuildError("The evidence changed after the ontology was checked (a source was re-fetched or re-extracted). Run `check ontology` again.")
+    return candidate
+
+
 def approved_ontology(workspace: Workspace) -> dict[str, Any]:
     approval_path = workspace.path("ontology", "approval.json")
     if not approval_path.exists():

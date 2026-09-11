@@ -7,10 +7,11 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, compile as compiler, extract, keyfile, ontology, plan, render, sources, vapi
+from . import __version__, compile as compiler, extract, keyfile, ontology, plan, preview, render, sources, vapi
 from .workspace import BuildError, Workspace, read_json
 
 DEFAULT_ROOT = "~/vapi-build-projects"
+LAUNCHER = Path(__file__).resolve().parents[1] / "vapi-build"
 
 
 def _workspace(args) -> Workspace:
@@ -19,14 +20,14 @@ def _workspace(args) -> Workspace:
 
 def cmd_doctor(args) -> int:
     print(f"vapi-build {__version__} · python {sys.version.split()[0]}")
-    for module in ("jsonschema", "yaml", "boto3"):
+    for module, hint in (("jsonschema", "required"), ("yaml", "only for YAML sources: knowledge files or an OpenAPI document in YAML"), ("boto3", "only for s3:// sources")):
         try:
             importlib.import_module(module)
             print(f"  ok   {module}")
         except ImportError:
-            print(f"  MISSING {module}  (pip install {'pyyaml' if module == 'yaml' else module}){'; only needed for s3:// sources' if module == 'boto3' else ''}")
+            print(f"  MISSING {module}  (pip install {'pyyaml' if module == 'yaml' else module}); {hint}")
     _, source = vapi.find_key()
-    print(f"  {'ok  ' if source else 'unset'} Vapi private key" + (f" from {source}" if source else " (run `secrets find`, then `secrets set VAPI_API_KEY --from-env NAME --verify` or `--from-file PATH --var NAME`; needed only for apply/test/teardown)"))
+    print(f"  {'ok  ' if source else 'unset'} Vapi private key" + (f" from {source}" if source else " (export VAPI_API_KEY, or run `secrets find` then `secrets set VAPI_API_KEY --from-env NAME --verify`; needed only for apply/test/simulate/teardown)"))
     aws = any(os.environ.get(k) for k in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID")) or Path("~/.aws/credentials").expanduser().exists() or Path("~/.aws/config").expanduser().exists()
     print(f"  {'ok  ' if aws else 'unset'} AWS credentials (needed only for s3:// sources)")
     return 0
@@ -108,7 +109,10 @@ def _print_report(report: dict, workspace: Workspace) -> int:
             print(f"    - {operation}")
     if report["status"] == "CANDIDATE":
         print(f"  digest {report['digest']}")
-        print(f"Next: `summarize {report['stage']}` for the user, then `approve {report['stage']}` once they say yes.")
+        if report["stage"] == "ontology":
+            print(f"Next: write {workspace.path('plan', 'plan.json')} and run `check plan`; the review page shows both.")
+        else:
+            print("Next: `render`, then `open`, and ask the user for their yes; `approve plan` records it for the ontology and the plan together.")
     return 0 if report["status"] == "CANDIDATE" else 1
 
 
@@ -123,26 +127,55 @@ def cmd_summarize(args) -> int:
     if args.stage == "ontology":
         text = ontology.summarize(ontology.load_candidate(workspace))
     else:
-        text = plan.summarize(plan.load_candidate(workspace), ontology.approved_ontology(workspace))
+        text = plan.summarize(plan.load_candidate(workspace), ontology.load_candidate(workspace))
     print(text)
     return 0
 
 
 def cmd_render(args) -> int:
-    workspace = _workspace(args)
-    path = render.render_ontology(workspace) if args.stage == "ontology" else render.render_plan(workspace)
+    workspace = Workspace.open(args.args[-1])  # `render <ws>`; `render ontology|plan <ws>` still accepted
+    path = render.render_review(workspace)
+    live = preview.status(workspace)
     print(f"Wrote {path}")
-    print("Publish it with the Artifact tool (favicon on first publish) and give the user the link; it is the review surface for this gate.")
+    if live and live.get("viewerOpen"):
+        print("The review page is open in the browser and refreshes itself; no need to open it again.")
+    else:
+        print("Run `open <workspace>` to show it (it refreshes itself on later renders); publish it with the Artifact tool when a shareable link is wanted.")
     return 0
 
 
 def cmd_open(args) -> int:
     import webbrowser
 
-    if not str(args.url).startswith("https://"):
-        raise BuildError("open takes an https URL, normally the published artifact link.")
-    opened = webbrowser.open(args.url, new=2)
-    print(f"Opened {args.url} in the default browser." if opened else f"Could not open a browser; give the user the link: {args.url}")
+    target = str(args.target)
+    if target.startswith("https://"):
+        opened = webbrowser.open(target, new=2)
+        print(f"Opened {target} in the default browser." if opened else f"Could not open a browser; give the user the link: {target}")
+        return 0
+    result = preview.open_review(Workspace.open(target))
+    if result["action"] == "refreshed":
+        print(f"Already open at {result['url']} and refreshed itself; nothing launched.")
+    elif result["action"] == "opened":
+        print(f"Opened {result['url']} in the default browser. It refreshes itself after every `render`.")
+    else:
+        print(f"Could not open a browser; give the user the link: {result['url']}")
+    return 0
+
+
+def cmd_preview(args) -> int:
+    workspace = Workspace.open(args.workspace)
+    if args.action == "serve":
+        preview.serve_forever(workspace.root, args.port)
+        return 0
+    if args.action == "stop":
+        print("Stopped the preview server." if preview.stop(workspace) else "No preview server was running.")
+        return 0
+    live = preview.status(workspace)
+    if not live:
+        print("No preview server is running for this workspace.")
+        return 1
+    print(f"Serving {live['url']} (pid {live['pid']}); viewer {'open' if live['viewerOpen'] else 'closed'}"
+          + (f", last poll {live['lastPollSecondsAgo']}s ago" if live.get("lastPollSecondsAgo") is not None else ""))
     return 0
 
 
@@ -151,7 +184,9 @@ def cmd_approve(args) -> int:
     approval = ontology.approve_ontology(workspace, by=args.by) if args.stage == "ontology" else plan.approve_plan(workspace, by=args.by)
     print(f"Approved {approval['stage']} {approval['digest']} by {approval['by']} at {approval['at']}")
     if approval["stage"] == "plan":
-        print("Next: `compile`, review vapi/summary.md with the user, then `apply --yes`.")
+        if approval.get("ontologyApprovedHere"):
+            print(f"Also approved the ontology {approval['ontologyDigest']} it was checked against (one review page, one yes).")
+        print("Next: `compile`, then `render` so the Build tab fills in, and ask for the go-ahead before `apply --yes`.")
     else:
         print(f"Next: write {workspace.path('plan', 'plan.json')} and run `check plan`.")
     return 0
@@ -167,8 +202,8 @@ def cmd_compile(args) -> int:
         for name in needed:
             print(f"  token {name}: {'present in' if saved.get(name) else 'MISSING from'} {vapi.KEY_FILE}")
         if any(not saved.get(name) for name in needed):
-            print("  Ask the user to add the missing NAME=value line(s) to that file before `apply`.")
-    print(f"Payloads: {workspace.path('vapi', 'build.json')}")
+            print("  Copy each missing token with `secrets set NAME --from-env NAME` (or --from-file) before `apply`.")
+    print(f"Payloads: {workspace.path('vapi', 'build.json')}. Next: `render` and `open` so the Build tab shows this.")
     return 0
 
 
@@ -188,11 +223,16 @@ def cmd_apply(args) -> int:
         print(f"Applied. knowledge base {kb.get('id')} (search tool {kb.get('toolId')})")
     for ref, identifier in receipts["tools"].items():
         print(f"  {ref} → {identifier}")
+    for ref, identifier in receipts.get("structuredOutputs", {}).items():
+        print(f"  {ref} → {identifier}")
     for ref, identifier in receipts["assistants"].items():
         print(f"  {ref} → {identifier}")
     if receipts["squad"].get("id"):
         print(f"  squad → {receipts['squad']['id']}")
-    print("Verified every resource by reading it back. Next: `test` runs the plan's scenarios through Vapi chat.")
+    sims = receipts.get("simulations", {})
+    if sims.get("suite", {}).get("id"):
+        print(f"  simulation suite → {sims['suite']['id']} ({len(sims.get('simulations', {}))} simulations)")
+    print("Verified every resource by reading it back. Next: `test` (chat scenarios) and `simulate --yes` (Vapi simulation suite), then `render`.")
     return 0
 
 
@@ -231,6 +271,19 @@ def cmd_test(args) -> int:
     return 0
 
 
+def cmd_simulate(args) -> int:
+    workspace = _workspace(args)
+    _require_applied(workspace)
+    if not args.yes:
+        print("simulate runs the Vapi simulation suite against the applied agent; it uses credits and concurrency, and unmocked tools call the live API. Re-run with --yes after the user confirms.")
+        return 1
+    report = vapi.run_simulations(workspace, vapi.client_from_env(), iterations=args.iterations)
+    print(vapi.render_simulation_report(report))
+    failed = [r for r in report["results"] if r.get("passed") is False]
+    print(f"Saved {workspace.path('vapi', 'simulation-results.json')}: {len(report['results']) - len(failed)} passed, {len(failed)} failed. Run `render` so the Build tab shows the results.")
+    return 0 if not failed else 1
+
+
 def cmd_secrets(args) -> int:
     if args.action == "set":
         if args.from_env:
@@ -256,7 +309,7 @@ def cmd_secrets(args) -> int:
         candidates = keyfile.find_candidates()
         if not candidates:
             print("No file or shell profile on this machine declares a VAPI_* key or token.")
-            print(f"Fallback: in the Terminal tab of the Claude app, run `{Path.home() / '.claude/skills/vapi-build/vapi-build'} secrets prompt VAPI_API_KEY` and paste the key at the hidden prompt.")
+            print(f"Fallback: in a terminal, run `{LAUNCHER} secrets prompt VAPI_API_KEY` and paste the key at the hidden prompt.")
             return 1
         for candidate in candidates:
             hint = "--from-env NAME" if candidate["kind"] == "shell profile" else f"--from-file {candidate['path']} --var NAME"
@@ -304,9 +357,14 @@ def cmd_status(args) -> int:
         print(f"  build: {'compiled' if build_path.exists() else 'not compiled'}")
     receipts = vapi.load_receipts(workspace)
     if receipts:
-        print(f"  applied: kb {receipts['knowledgeBase'].get('id')}, {len(receipts['tools'])} tools, {len(receipts['assistants'])} assistants, verified={receipts['verified']}")
+        sims = receipts.get("simulations", {})
+        print(f"  applied: kb {receipts['knowledgeBase'].get('id') or receipts['knowledgeBase'].get('toolId')}, {len(receipts['tools'])} tools, {len(receipts.get('structuredOutputs', {}))} structured outputs, "
+              f"{len(receipts['assistants'])} assistants, {len(sims.get('simulations', {}))} simulations, verified={receipts['verified']}")
     else:
         print("  applied: no")
+    review = workspace.path(render.PAGE)
+    live = preview.status(workspace)
+    print(f"  review page: {'rendered' if review.exists() else 'not rendered'}" + (f", served at {live['url']} ({'open' if live['viewerOpen'] else 'no viewer'})" if live else ""))
     return 0
 
 
@@ -323,7 +381,7 @@ def cmd_teardown(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="vapi-build", description="Evidence → ontology → plan → Vapi agent.")
+    parser = argparse.ArgumentParser(prog="vapi-build", description="Evidence → ontology → plan → Vapi agent with structured outputs and simulations.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor", help="check local prerequisites").set_defaults(func=cmd_doctor)
@@ -358,8 +416,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=10, help="conversations per transcript segment")
     p.set_defaults(func=cmd_extract)
 
-    for name, func in (("check", cmd_check), ("summarize", cmd_summarize), ("render", cmd_render), ("approve", cmd_approve)):
-        p = sub.add_parser(name, help={"check": "validate the candidate", "summarize": "plain-text summary", "render": "interactive HTML page: graph, browse, evidence", "approve": "record the user's yes"}[name])
+    for name, func in (("check", cmd_check), ("summarize", cmd_summarize), ("approve", cmd_approve)):
+        p = sub.add_parser(name, help={"check": "validate the candidate", "summarize": "plain-text summary", "approve": "record the user's yes (approve plan covers the ontology too)"}[name])
         p.add_argument("stage", choices=("ontology", "plan"))
         p.add_argument("workspace")
         if name == "check":
@@ -367,6 +425,20 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "approve":
             p.add_argument("--by", help="who approved (defaults to git user.email)")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("render", help="write <workspace>/review.html: Ontology, Plan, and Build tabs with graph, browse, and evidence")
+    p.add_argument("args", nargs="+", metavar="workspace", help="the workspace (a leading `ontology` or `plan` word is ignored)")
+    p.set_defaults(func=cmd_render)
+
+    p = sub.add_parser("open", help="show the review page once; an open tab refreshes itself, so this never opens a second copy")
+    p.add_argument("target", help="the workspace, or an https link (for example a published Artifact)")
+    p.set_defaults(func=cmd_open)
+
+    p = sub.add_parser("preview", help="the local review-page server: status | stop | serve")
+    p.add_argument("action", choices=("status", "stop", "serve"))
+    p.add_argument("workspace")
+    p.add_argument("--port", type=int, default=0)
+    p.set_defaults(func=cmd_preview)
 
     p = sub.add_parser("secrets", help="copy the Vapi key or a tool token into ~/.config/vapi-build/env without showing it")
     actions = p.add_subparsers(dest="action", required=True)
@@ -392,17 +464,19 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("name")
     a.set_defaults(func=cmd_secrets)
 
-    p = sub.add_parser("open", help="open a published artifact link in the user's default browser")
-    p.add_argument("url")
-    p.set_defaults(func=cmd_open)
-
     p = sub.add_parser("merge", help="combine ontology/fragments/*.json into ontology/ontology.json")
     p.add_argument("workspace")
     p.set_defaults(func=cmd_merge)
 
-    p = sub.add_parser("test", help="run the plan's test scenarios against the applied agent through Vapi chat")
+    p = sub.add_parser("test", help="run the plan's chat test scenarios against the applied agent")
     p.add_argument("workspace")
     p.set_defaults(func=cmd_test)
+
+    p = sub.add_parser("simulate", help="run the applied Vapi simulation suite and report every evaluation")
+    p.add_argument("workspace")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--iterations", type=int, default=1)
+    p.set_defaults(func=cmd_simulate)
 
     p = sub.add_parser("compile", help="write Vapi payloads and knowledge files from the approved plan")
     p.add_argument("workspace")

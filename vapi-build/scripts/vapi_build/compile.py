@@ -105,7 +105,14 @@ def _tool_payload(tool: dict[str, Any], server_url: str) -> dict[str, Any]:
     if tool.get("extract"):
         payload["variableExtractionPlan"] = {"aliases": [{"key": key, "value": value} for key, value in tool["extract"].items()]}
     if tool.get("staticParameters"):
-        payload["parameters"] = [{"key": key, "value": value} for key, value in tool["staticParameters"].items()]
+        # Fixed or Liquid body values the model never fills, e.g. the caller's ANI as {{customer.number}}.
+        body = payload.setdefault("body", {"type": "object", "properties": {}})
+        body.setdefault("properties", {})
+        for key, value in tool["staticParameters"].items():
+            existing = body["properties"].get(key, {})
+            body["properties"][key] = {**existing, "type": existing.get("type") or ("string" if isinstance(value, str) else "boolean" if isinstance(value, bool) else "number"), "value": value}
+            if key in (body.get("required") or []):
+                body["required"] = [r for r in body["required"] if r != key]
     if tool["auth"]["mode"] == "VAPI_CREDENTIAL":
         payload["credentialId"] = tool["auth"]["credentialId"]
     return payload
@@ -146,6 +153,14 @@ def _job_section(jobs: list[dict[str, Any]], ontology: dict[str, Any], tool_name
     return "\n".join(lines)
 
 
+def _destination(handoff: dict[str, Any], assistant_name: str) -> dict[str, Any]:
+    """A handoff destination: the named assistant, when to go there, and which variables travel with the caller."""
+    destination = {"type": "assistant", "assistantName": assistant_name, "description": handoff["when"], "contextEngineeringPlan": {"type": "userAndAssistantMessages"}}
+    if handoff.get("carry"):
+        destination["variableExtractionPlan"] = {"schema": {"type": "object", "properties": {key: {"type": "string", "description": what} for key, what in handoff["carry"].items()}}}
+    return destination
+
+
 def _system_prompt(assistant: dict[str, Any], plan: dict[str, Any], tools: dict[str, dict[str, Any]], ontology: dict[str, Any] | None = None) -> str:
     parts = [assistant["systemPrompt"].strip()]
     jobs = [job for job in plan["jobs"] if job["id"] in set(assistant.get("jobs", []))]
@@ -166,7 +181,8 @@ def _system_prompt(assistant: dict[str, Any], plan: dict[str, Any], tools: dict[
     if assistant.get("handoffTo"):
         lines = ["# Handoffs"]
         for handoff in assistant["handoffTo"]:
-            lines.append(f"- Hand off to {handoff['assistant']} when {handoff['when']}")
+            carry = f" Carry along: {', '.join(f'{k} ({v})' for k, v in handoff['carry'].items())}." if handoff.get("carry") else ""
+            lines.append(f"- Hand off to {handoff['assistant']} when {handoff['when']}.{carry}")
         parts.append("\n".join(lines))
     if plan.get("exclusions"):
         parts.append("# Out of scope\n" + "\n".join(f"- {item['what']}: {item['why']}" for item in plan["exclusions"]))
@@ -257,11 +273,7 @@ def compile_build(workspace: Workspace) -> dict[str, Any]:
         prompt = _system_prompt({**assistant, "tools": tool_names, "handoffTo": [{**h, "assistant": names[h["assistant"]]} for h in assistant.get("handoffTo", [])]}, plan, tools_by_name, ontology)
         model = {**plan["runtime"]["model"], "messages": [{"role": "system", "content": prompt}]}
         if assistant.get("handoffTo"):
-            model["tools"] = [{
-                "type": "handoff",
-                "destinations": [{"type": "assistant", "assistantName": names[h["assistant"]], "description": h["when"], "contextEngineeringPlan": {"type": "userAndAssistantMessages"}}
-                                 for h in assistant["handoffTo"]],
-            }]
+            model["tools"] = [{"type": "handoff", "destinations": [_destination(h, names[h["assistant"]]) for h in assistant["handoffTo"]]}]
         payload = {
             "name": assistant["name"],
             "firstMessageMode": "assistant-speaks-first" if assistant.get("firstMessage") else "assistant-speaks-first-with-model-generated-message",
@@ -273,26 +285,68 @@ def compile_build(workspace: Workspace) -> dict[str, Any]:
         if assistant.get("firstMessage"):
             payload["firstMessage"] = assistant["firstMessage"]
         assistant_records.append({"ref": f"assistant:{assistant['id']}", "payload": payload, "toolRefs": [f"tool:{name}" for name in tool_names],
-                                  "knowledge": assistant.get("knowledge", True)})
+                                  "knowledge": assistant.get("knowledge", True),
+                                  "outputRefs": [output["id"] for output in plan.get("structuredOutputs", []) if assistant["id"] in output["assistants"]]})
+    # Structured outputs: one saved definition each; apply attaches them through artifactPlan.structuredOutputIds.
+    output_records = [{"ref": output["id"], "payload": {"name": output["name"], "description": output["description"], "type": output["type"], "schema": output["schema"]},
+                       "assistantRefs": [f"assistant:{a}" for a in output["assistants"]], "jobs": output.get("jobs", [])} for output in plan.get("structuredOutputs", [])]
+    simulations = _simulation_records(plan, by_operation) if plan.get("simulations") else None
     squad = None
     if len(plan["assistants"]) > 1:
         entry = plan["squad"]["entry"]
         ordered = sorted(plan["assistants"], key=lambda a: a["id"] != entry)
         squad = {"ref": "squad:main", "payload": {"name": plan["squad"].get("name") or f"{plan['agent']['name']} squad"},
-                 "members": [{"assistantRef": f"assistant:{a['id']}",
-                              "assistantDestinations": [{"type": "assistant", "assistantName": names[h["assistant"]], "description": h["when"], "contextEngineeringPlan": {"type": "userAndAssistantMessages"}}
-                                                        for h in a.get("handoffTo", [])]} for a in ordered]}
+                 "members": [{"assistantRef": f"assistant:{a['id']}", "assistantDestinations": [_destination(h, names[h["assistant"]]) for h in a.get("handoffTo", [])]} for a in ordered]}
     build = {
         "compiledAt": utc_now(), "project": workspace.project["name"], "projectSlug": project_slug,
         "planDigest": plan["digest"], "ontologyDigest": plan["ontologyDigest"], "ledgerDigest": ontology["ledgerDigest"],
         "knowledgeBase": {"name": (selection.get("name") or f"{plan['agent']['name']} knowledge")[:80],
                           "description": f"Compiled by vapi-build from {len(files)} files; plan {plan['digest'][:23]}"[:1000], "files": files},
         "tools": tool_records, "assistants": assistant_records, "squad": squad,
+        "structuredOutputs": output_records, "simulations": simulations,
         "tests": plan.get("tests", []),
     }
     write_json(out / "build.json", build)
     (out / "summary.md").write_text(render_build_summary(build), encoding="utf-8")
     return build
+
+
+def _simulation_records(plan: dict[str, Any], by_operation: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Vapi simulation payloads: personalities (AI testers), scenarios with evaluations and tool mocks, one simulation per scenario, one suite."""
+    sims = plan["simulations"]
+    model = plan["runtime"]["model"]
+    personalities = [{
+        "ref": personality["id"],
+        "payload": {"name": personality["name"][:80],
+                    "assistant": {"name": personality["name"][:40],
+                                  "model": {"provider": model["provider"], "model": model["model"], "messages": [{"role": "system", "content": personality["prompt"]}]}}},
+    } for personality in sims["personalities"]]
+    scenarios = []
+    for scenario in sims["scenarios"]:
+        evaluations, labels = [], []
+        for evaluation in scenario["evaluations"]:
+            item: dict[str, Any] = {"comparator": evaluation.get("comparator", "="), "value": evaluation["value"], "required": evaluation.get("required", True)}
+            if evaluation.get("path"):
+                item["path"] = evaluation["path"]
+            if "output" in evaluation:
+                item["structuredOutputRef"] = evaluation["output"]  # resolved to structuredOutputId at apply time
+            else:
+                item["structuredOutput"] = {"name": evaluation["name"], "description": evaluation.get("description") or evaluation["name"], "type": "ai", "schema": evaluation["schema"]}
+            evaluations.append(item)
+            labels.append(evaluation["name"])
+        payload: dict[str, Any] = {"name": scenario["name"][:80], "instructions": scenario["instructions"], "evaluations": evaluations}
+        if scenario.get("toolMocks"):
+            payload["toolMocks"] = [{"toolName": by_operation[m["tool"]]["name"] if m["tool"] in by_operation else m["tool"], "result": m["result"], "enabled": True} for m in scenario["toolMocks"]]
+        if scenario.get("variables"):
+            payload["targetOverrides"] = {"variableValues": scenario["variables"]}
+        scenarios.append({"ref": scenario["id"], "personalityRef": scenario["personality"], "payload": payload, "evaluationLabels": labels, "jobs": scenario.get("jobs", [])})
+    return {
+        "transport": sims.get("transport", "vapi.webchat"),
+        "personalities": personalities,
+        "scenarios": scenarios,
+        "simulations": [{"ref": "simulation:" + s["ref"].split(":", 1)[1], "name": s["payload"]["name"], "scenarioRef": s["ref"], "personalityRef": s["personalityRef"]} for s in scenarios],
+        "suite": {"name": (sims.get("suiteName") or f"{plan['agent']['name']} simulations")[:80]},
+    }
 
 
 def render_build_summary(build: dict[str, Any]) -> str:
@@ -317,8 +371,20 @@ def render_build_summary(build: dict[str, Any]) -> str:
         lines += ["", "## Tokens read from ~/.config/vapi-build/env at apply time (never written to disk here)"]
         for env in secrets:
             lines.append(f"- {env}")
+    if build.get("structuredOutputs"):
+        lines += ["", f"## Structured outputs ({len(build['structuredOutputs'])}), extracted after every call"]
+        for output in build["structuredOutputs"]:
+            schema = output["payload"]["schema"]
+            fields = ", ".join((schema.get("properties") or {}).keys()) if schema.get("type") == "object" else schema.get("type", "")
+            lines.append(f"- {output['payload']['name']} → {', '.join(r.split(':', 1)[1] for r in output['assistantRefs'])}: {fields}")
+    if build.get("simulations"):
+        sims = build["simulations"]
+        lines += ["", f"## Simulations: suite “{sims['suite']['name']}” ({len(sims['scenarios'])} scenarios, {sims['transport']})"]
+        for scenario in sims["scenarios"]:
+            mocks = f" · mocks {', '.join(m['toolName'] for m in scenario['payload'].get('toolMocks', []))}" if scenario["payload"].get("toolMocks") else ""
+            lines.append(f"- {scenario['payload']['name']} as {scenario['personalityRef']}: {'; '.join(scenario['evaluationLabels'])}{mocks}")
     if build["tests"]:
-        lines += ["", f"## Test scenarios ({len(build['tests'])})"]
+        lines += ["", f"## Chat test scenarios ({len(build['tests'])})"]
         for test in build["tests"]:
             lines.append(f"- {test['scenario']}: “{test['callerOpening']}” → {'; '.join(test['expect'])}")
     return "\n".join(lines) + "\n"

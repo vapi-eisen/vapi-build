@@ -39,6 +39,13 @@ PAGES = {
                                    "requestBody": {"required": True, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/NewBooking"}}}},
                                    "responses": {"201": {"description": "created"}}}},
             "/admin/reset": {"post": {"operationId": "adminReset", "summary": "Reset the demo database", "responses": {"204": {"description": "reset"}}}},
+            "/customers/by-phone": {"get": {"operationId": "lookupCustomerByPhone", "summary": "Find the customer record for a phone number",
+                                            "parameters": [{"name": "phone", "in": "query", "required": True, "schema": {"type": "string"}}],
+                                            "responses": {"200": {"description": "ok"}}}},
+            "/customers/{customerId}/verify-pin": {"post": {"operationId": "verifyPin", "summary": "Check the caller's PIN",
+                                                            "parameters": [{"name": "customerId", "in": "path", "required": True, "schema": {"type": "string"}}],
+                                                            "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "required": ["pin"], "properties": {"pin": {"type": "string"}}}}}},
+                                                            "responses": {"200": {"description": "ok"}}}},
         },
         "components": {"schemas": {
             "Schedule": {"type": "object", "properties": {"departures": {"type": "array", "items": {"type": "string"}}, "next": {"$ref": "#/components/schemas/Schedule"}}},
@@ -156,7 +163,8 @@ def valid_ontology(ledger: dict) -> dict:
 def valid_plan() -> dict:
     prompt = "You are the Harbor Light Ferries concierge. Help passengers with schedules, bookings, and refunds. Be brief and warm. Never guess fares or times; look them up."
     return {
-        "agent": {"name": "Harbor Light Concierge", "purpose": "Answer passenger questions and take bookings for Harbor Light Ferries."},
+        "agent": {"name": "Harbor Light Concierge", "purpose": "Answer passenger questions and take bookings for Harbor Light Ferries.",
+                  "topology": {"choice": "single", "why": "Three closely related passenger jobs share one tool set and one persona; no front door because bookings are looked up by reference, not by caller identity."}},
         "runtime": {"serverUrl": "https://ferries.example"},
         "jobs": [
             {"id": "job:schedule", "label": "Tell callers when boats leave", "goals": ["goal:travel"], "handling": "TOOL_ACTION", "tools": ["getSchedule"], "knowledge": ["claim:adult-fare"]},
@@ -179,6 +187,33 @@ def valid_plan() -> dict:
     }
 
 
+def rich_plan() -> dict:
+    """valid_plan plus the structured outputs and simulations a reviewer expects."""
+    data = valid_plan()
+    data["structuredOutputs"] = [
+        {"id": "output:call-outcome", "name": "Call outcome", "description": "What the caller wanted and whether it was resolved.",
+         "schema": {"type": "object", "properties": {"intent": {"type": "string", "enum": ["schedule", "booking", "refund", "other"]}, "resolved": {"type": "boolean"},
+                                                      "summary": {"type": "string", "description": "One sentence."}}, "required": ["intent", "resolved"]},
+         "jobs": ["job:schedule", "job:book", "job:refund"]},
+        {"id": "output:booking-made", "name": "Booking made", "description": "True only when the assistant confirmed a booking.", "schema": {"type": "boolean"}, "jobs": ["job:book"]},
+    ]
+    data["simulations"] = {
+        "personalities": [{"id": "personality:hurried", "name": "Hurried commuter",
+                           "prompt": "You are a hurried commuter who wants quick answers and gives details only when asked. Stay in character and use only the facts the scenario gives you."}],
+        "scenarios": [
+            {"id": "scenario:last-boat", "name": "Ask for the last boat", "personality": "personality:hurried", "jobs": ["job:schedule"],
+             "instructions": "Ask when the last boat leaves Gull Island tonight. End the conversation once you have been given a time.",
+             "evaluations": [{"name": "gave_time", "description": "True if the assistant stated a departure time.", "schema": {"type": "boolean"}, "value": True}]},
+            {"id": "scenario:book-two", "name": "Book two seats", "personality": "personality:hurried", "jobs": ["job:book"],
+             "instructions": "Book two adult seats from Northport to Gull Island tomorrow morning. Confirm the details when the assistant reads them back.",
+             "evaluations": [{"name": "booked", "output": "output:booking-made", "value": True},
+                             {"name": "intent", "output": "output:call-outcome", "path": "intent", "value": "booking"}],
+             "toolMocks": [{"tool": "createBooking", "result": "{\"bookingId\":\"SIM-1\",\"status\":\"confirmed\"}"}]},
+        ],
+    }
+    return data
+
+
 class FakeVapi:
     """Records calls and answers like Vapi does, including knowledge-base indexing."""
 
@@ -188,6 +223,7 @@ class FakeVapi:
         self.kb_tool_in_get = kb_tool_in_get
         self.v2_enabled = v2_enabled
         self.files: list[str] = []
+        self.posted: list[tuple[str, str]] = []
 
     def __call__(self, method: str, url: str, headers: dict, data: bytes | None):
         path = url.split("api.vapi.ai", 1)[1]
@@ -204,6 +240,17 @@ class FakeVapi:
             self.counter += 1
             self.files.append(f"file_{self.counter}")
             return 201, json.dumps({"id": f"file_{self.counter}", "status": "processing"}).encode()
+        if method == "POST" and path == "/eval/simulation/run":
+            self.counter += 1
+            self.run_polls = 0
+            return 201, json.dumps({"id": f"run_{self.counter}", "status": "queued", "url": "https://dashboard.vapi.ai/simulations/run"}).encode()
+        if method == "GET" and path.startswith("/eval/simulation/run/") and path.endswith("/item"):
+            simulation_id = next((c[1] for c in self.posted if c[0] == "/eval/simulation"), "simulation_?")
+            return 200, json.dumps([{"id": "item_1", "simulationId": simulation_id, "status": "ended", "iteration": 1, "transcript": "AI: hi\nAssistant: hello",
+                                     "results": {"passed": True, "evaluations": [{"name": "gave_time", "extractedValue": True, "expectedValue": True, "comparator": "=", "required": True, "passed": True}]}}]).encode()
+        if method == "GET" and path.startswith("/eval/simulation/run/"):
+            self.run_polls = getattr(self, "run_polls", 0) + 1
+            return 200, json.dumps({"id": path.rsplit("/", 1)[1], "status": "running" if self.run_polls < 2 else "ended", "itemCounts": {"total": 1, "failed": 0, "canceled": 0}}).encode()
         if method == "POST" and path == "/chat":
             self.counter += 1
             return 201, json.dumps({"id": f"chat_{self.counter}", "previousChatId": body.get("previousChatId"),
@@ -213,6 +260,7 @@ class FakeVapi:
         if method == "POST":
             self.counter += 1
             kind = path.strip("/").split("/")[-1]
+            self.posted.append((path, f"{kind}_{self.counter}"))
             return 201, json.dumps({"id": f"{kind}_{self.counter}"}).encode()
         if method == "GET" and path.startswith("/v2/knowledge-base/") and not path.endswith("/file"):
             identifier = path.rsplit("/", 1)[1]

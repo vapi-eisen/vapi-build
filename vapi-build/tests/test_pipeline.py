@@ -228,6 +228,7 @@ def test_squad_with_handoffs(project):
          "tools": ["getSchedule", "getBooking", "createBooking"], "handoffTo": [{"assistant": "front", "when": "the caller asks about refunds"}]},
     ]
     data["squad"] = {"entry": "front"}
+    data["agent"]["topology"] = {"choice": "squad", "why": "Refund policy questions and booking actions have different tool access; a front desk routes callers."}
     project.path("plan", "plan.json").write_text(json.dumps(data))
     assert plan.check_plan(project)["status"] == "CANDIDATE"
     plan.approve_plan(project, by="tester")
@@ -294,21 +295,23 @@ def test_re_extract_invalidates_ontology_approval(project):
         ontology.approved_ontology(project)
 
 
-def test_render_ontology_and_plan_pages(project):
+def test_render_review_page_grows_tab_by_tab(project):
     from vapi_build import render
 
+    with pytest.raises(BuildError, match="Nothing to render"):
+        render.render_review(project)
     write_ontology(project, valid_ontology(extract.load_ledger(project)))
     assert ontology.check_ontology(project)["status"] == "CANDIDATE"
-    page = render.render_ontology(project).read_text()
-    assert page.startswith('<meta charset="utf-8">\n<title>') and "cdnjs.cloudflare.com/ajax/libs/d3/" in page
-    assert "Get a refund" in page and "getSchedule" in page and '"evidence":{' in page
+    page = render.render_review(project).read_text()
+    assert page.startswith('<meta charset="utf-8">\n<title>') and "cdnjs.cloudflare.com/ajax/libs/d3/" in page and 'data-digest="sha256:' in page
+    assert "Get a refund" in page and "getSchedule" in page and '"evidence":{' in page and '"plan":null' in page and '"build":null' in page
     assert "</script" not in page.split('<script id="data"')[1].split("</script>")[0]  # embedded JSON cannot close the script early
-    ontology.approve_ontology(project, by="tester")
+    assert 'data-tab="ontology"' in page and 'data-tab="plan"' in page and 'data-tab="build"' in page
     project.path("plan", "plan.json").write_text(json.dumps(valid_plan()))
     assert plan.check_plan(project)["status"] == "CANDIDATE"
-    page = render.render_plan(project).read_text()
-    assert "Harbor Light Concierge" in page and "createBooking" in page and "enabledOperations" in page
-    assert project.path("plan", "plan.html").exists()
+    page = render.render_review(project).read_text()
+    assert "Harbor Light Concierge" in page and "createBooking" in page and "enabledOperations" in page and '"topology":{"choice":"single"' in page
+    assert project.path("review.html").exists() and not project.path("plan", "plan.html").exists()
 
 
 def test_apply_falls_back_to_query_tool_without_knowledge_v2(project, monkeypatch):

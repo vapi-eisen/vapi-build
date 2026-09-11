@@ -163,6 +163,8 @@ def apply(workspace: Workspace, client: VapiClient, *, secrets: dict[str, str] |
     _check_build_is_current(workspace, build)
     secrets = load_env_file() if secrets is None else secrets
     receipts = load_receipts(workspace) or {"planDigest": build["planDigest"], "startedAt": utc_now(), "files": {}, "knowledgeBase": {}, "tools": {}, "assistants": {}, "squad": {}, "verified": False}
+    receipts.setdefault("structuredOutputs", {})
+    receipts.setdefault("simulations", {"personalities": {}, "scenarios": {}, "simulations": {}, "suite": {}})
     if receipts["planDigest"] != build["planDigest"]:
         raise BuildError("Receipts belong to a different build. Run `teardown` before applying a new plan, or delete vapi/receipts.json if those resources are already gone.")
     for file in build["knowledgeBase"]["files"]:
@@ -233,6 +235,14 @@ def apply(workspace: Workspace, client: VapiClient, *, secrets: dict[str, str] |
         receipts["tools"][tool["ref"]] = created["id"]
         _save(workspace, receipts)
 
+    # Structured outputs exist before the assistants so each assistant can be created already attached to them.
+    for output in build.get("structuredOutputs", []):
+        if output["ref"] in receipts["structuredOutputs"]:
+            continue
+        created = client.request("POST", "/structured-output", output["payload"])
+        receipts["structuredOutputs"][output["ref"]] = created["id"]
+        _save(workspace, receipts)
+
     for assistant in build["assistants"]:
         if assistant["ref"] in receipts["assistants"]:
             continue
@@ -242,6 +252,8 @@ def apply(workspace: Workspace, client: VapiClient, *, secrets: dict[str, str] |
             tool_ids.insert(0, receipts["knowledgeBase"]["toolId"])
         if tool_ids:
             payload["model"]["toolIds"] = tool_ids
+        if assistant.get("outputRefs"):
+            payload["artifactPlan"] = {**payload.get("artifactPlan", {}), "structuredOutputIds": [receipts["structuredOutputs"][ref] for ref in assistant["outputRefs"]]}
         created = client.request("POST", "/assistant", payload)
         receipts["assistants"][assistant["ref"]] = created["id"]
         _save(workspace, receipts)
@@ -252,11 +264,57 @@ def apply(workspace: Workspace, client: VapiClient, *, secrets: dict[str, str] |
         receipts["squad"] = {"id": created["id"]}
         _save(workspace, receipts)
 
+    if build.get("simulations"):
+        _apply_simulations(workspace, client, build, receipts)
+
     verify(workspace, client, receipts)
     receipts["verified"] = True
     receipts["appliedAt"] = utc_now()
     _save(workspace, receipts)
     return receipts
+
+
+def _target(receipts: dict[str, Any]) -> tuple[str, str]:
+    """(kind, id) of what callers reach: the squad when there is one, else the only assistant."""
+    if receipts.get("squad", {}).get("id"):
+        return "squad", receipts["squad"]["id"]
+    return "assistant", next(iter(receipts["assistants"].values()))
+
+
+def _apply_simulations(workspace: Workspace, client: VapiClient, build: dict[str, Any], receipts: dict[str, Any]) -> None:
+    """Personalities and scenarios, then one simulation per scenario, then the suite aimed at the applied target."""
+    sims = build["simulations"]
+    book = receipts["simulations"]
+    for personality in sims["personalities"]:
+        if personality["ref"] in book["personalities"]:
+            continue
+        created = client.request("POST", "/eval/simulation/personality", personality["payload"])
+        book["personalities"][personality["ref"]] = created["id"]
+        _save(workspace, receipts)
+    for scenario in sims["scenarios"]:
+        if scenario["ref"] in book["scenarios"]:
+            continue
+        payload = json.loads(json.dumps(scenario["payload"]))
+        for evaluation in payload["evaluations"]:
+            ref = evaluation.pop("structuredOutputRef", None)
+            if ref:
+                evaluation["structuredOutputId"] = receipts["structuredOutputs"][ref]
+        created = client.request("POST", "/eval/simulation/scenario", payload)
+        book["scenarios"][scenario["ref"]] = created["id"]
+        _save(workspace, receipts)
+    for simulation in sims["simulations"]:
+        if simulation["ref"] in book["simulations"]:
+            continue
+        created = client.request("POST", "/eval/simulation", {"name": simulation["name"], "scenarioId": book["scenarios"][simulation["scenarioRef"]],
+                                                              "personalityId": book["personalities"][simulation["personalityRef"]]})
+        book["simulations"][simulation["ref"]] = created["id"]
+        _save(workspace, receipts)
+    if not book["suite"].get("id"):
+        kind, identifier = _target(receipts)
+        created = client.request("POST", "/eval/simulation/suite", {"name": sims["suite"]["name"], "simulationIds": list(book["simulations"].values()),
+                                                                    "targetAssignments": [{"targetType": kind, "targetId": identifier}]})
+        book["suite"] = {"id": created["id"], "transport": sims["transport"]}
+        _save(workspace, receipts)
 
 
 V2_DISABLED_MARKER = "Knowledge Bases V2 is not enabled"
@@ -327,8 +385,13 @@ def verify(workspace: Workspace, client: VapiClient, receipts: dict[str, Any] | 
     receipts = receipts or load_receipts(workspace)
     if not receipts:
         raise BuildError("Nothing has been applied yet.")
-    checks = [("squad", receipts["squad"].get("id"))] if receipts.get("squad", {}).get("id") else []
+    sims = receipts.get("simulations", {})
+    checks = [("eval/simulation/suite", sims["suite"]["id"])] if sims.get("suite", {}).get("id") else []
+    checks += [("eval/simulation", i) for i in sims.get("simulations", {}).values()] + [("eval/simulation/scenario", i) for i in sims.get("scenarios", {}).values()]
+    checks += [("eval/simulation/personality", i) for i in sims.get("personalities", {}).values()]
+    checks += [("squad", receipts["squad"].get("id"))] if receipts.get("squad", {}).get("id") else []
     checks += [("assistant", i) for i in receipts["assistants"].values()] + [("tool", i) for i in receipts["tools"].values()]
+    checks += [("structured-output", i) for i in receipts.get("structuredOutputs", {}).values()]
     if receipts["knowledgeBase"].get("id"):
         checks.append(("v2/knowledge-base", receipts["knowledgeBase"]["id"]))
     elif receipts["knowledgeBase"].get("mode") == "query" and receipts["knowledgeBase"].get("toolId"):
@@ -360,11 +423,21 @@ def teardown(workspace: Workspace, client: VapiClient) -> list[str]:
         removed.append(f"{kind} {identifier}")
         return True
 
+    sims = receipts.get("simulations") or {}
+    if sims.get("suite", {}).get("id") and remove("eval/simulation/suite", sims["suite"]["id"]):
+        sims["suite"] = {}
+    for group, kind in (("simulations", "eval/simulation"), ("scenarios", "eval/simulation/scenario"), ("personalities", "eval/simulation/personality")):
+        for ref in list(sims.get(group, {})):
+            if remove(kind, sims[group][ref]):
+                sims[group].pop(ref)
     if receipts["squad"].get("id") and remove("squad", receipts["squad"]["id"]):
         receipts["squad"] = {}
     for ref in list(receipts["assistants"]):
         if remove("assistant", receipts["assistants"][ref]):
             receipts["assistants"].pop(ref)
+    for ref in list(receipts.get("structuredOutputs", {})):
+        if remove("structured-output", receipts["structuredOutputs"][ref]):
+            receipts["structuredOutputs"].pop(ref)
     for ref in list(receipts["tools"]):
         if remove("tool", receipts["tools"][ref]):
             receipts["tools"].pop(ref)
@@ -427,6 +500,76 @@ def run_tests(workspace: Workspace, client: VapiClient) -> dict[str, Any]:
     report = {"testedAt": utc_now(), "target": target, "results": results}
     write_json(workspace.path("vapi", "test-results.json"), report)
     return report
+
+
+TERMINAL_RUN_STATES = {"ended", "failed", "canceled", "cancelled", "completed"}
+
+
+def run_simulations(workspace: Workspace, client: VapiClient, *, sleep: Callable[[float], None] = time.sleep, poll_seconds: float = 10.0,
+                    timeout_seconds: float = 1800.0, iterations: int = 1) -> dict[str, Any]:
+    """Run the applied simulation suite against the applied target through Vapi, wait for it to end, and save every item's evaluations.
+
+    Vapi judges each evaluation itself (a structured output compared with the expected value); this
+    only collects and reports. Running costs credits and concurrency, so the CLI asks for --yes."""
+    build = load_build(workspace)
+    _check_build_is_current(workspace, build)
+    receipts = load_receipts(workspace)
+    if not receipts or not receipts.get("verified"):
+        raise BuildError("Apply the build before running simulations.")
+    suite = (receipts.get("simulations") or {}).get("suite", {})
+    if not suite.get("id"):
+        raise BuildError("The plan declares no simulations, so there is no suite to run. Add `simulations` to the plan (see the plan guide).")
+    kind, identifier = _target(receipts)
+    run = client.request("POST", "/eval/simulation/run", {
+        "simulations": [{"type": "simulationSuite", "simulationSuiteId": suite["id"]}],
+        "target": {"type": kind, f"{kind}Id": identifier},
+        "iterations": iterations,
+        "transport": {"provider": suite.get("transport") or "vapi.webchat"},
+    }) or {}
+    run_id = run.get("id")
+    if not run_id:
+        raise BuildError("Vapi did not return a simulation run id.")
+    waited = 0.0
+    status = run.get("status")
+    while status not in TERMINAL_RUN_STATES:
+        if waited >= timeout_seconds:
+            raise BuildError(f"Simulation run {run_id} is still {status} after {int(timeout_seconds)} seconds; check it in the dashboard{': ' + run['url'] if run.get('url') else ''}.")
+        sleep(poll_seconds)
+        waited += poll_seconds
+        run = client.request("GET", f"/eval/simulation/run/{run_id}") or {}
+        status = run.get("status")
+    items = client.request("GET", f"/eval/simulation/run/{run_id}/item") or []
+    if isinstance(items, dict):
+        items = items.get("results") or items.get("items") or []
+    names = {v: k for k, v in (receipts.get("simulations") or {}).get("simulations", {}).items()}
+    results = []
+    for item in items:
+        evaluations = [{"name": e.get("name") or e.get("structuredOutputName") or "", "expected": e.get("expectedValue"), "comparator": e.get("comparator"),
+                        "actual": e.get("extractedValue"), "required": e.get("required", True), "passed": e.get("passed"), "error": e.get("error"),
+                        "skipped": e.get("isSkipped"), "skipReason": e.get("skipReason")} for e in ((item.get("results") or {}).get("evaluations") or item.get("evaluations") or [])]
+        results.append({"itemId": item.get("id"), "simulation": names.get(item.get("simulationId"), item.get("simulationId")), "status": item.get("status"),
+                        "passed": (item.get("results") or {}).get("passed"), "failureReason": item.get("failureReason"), "iteration": item.get("iteration"),
+                        "transcript": item.get("transcript") or (item.get("artifact") or {}).get("transcript"), "evaluations": evaluations})
+    report = {"ranAt": utc_now(), "runId": run_id, "url": run.get("url"), "status": status, "itemCounts": run.get("itemCounts"), "target": {kind: identifier}, "results": results}
+    write_json(workspace.path("vapi", "simulation-results.json"), report)
+    return report
+
+
+def render_simulation_report(report: dict[str, Any]) -> str:
+    lines = [f"# Simulation run {report['runId']} · {report['status']}" + (f" · {report['url']}" if report.get("url") else ""), ""]
+    counts = report.get("itemCounts") or {}
+    if counts:
+        lines.append("Items: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    for result in report["results"]:
+        verdict = "PASS" if result.get("passed") else "FAIL" if result.get("passed") is False else (result.get("status") or "?")
+        lines.append(f"## {result['simulation']} · {verdict}" + (f" · {result['failureReason']}" if result.get("failureReason") else ""))
+        for evaluation in result["evaluations"]:
+            flag = "ok  " if evaluation.get("passed") else "FAIL" if evaluation.get("passed") is False else "skip"
+            detail = f"expected {evaluation.get('comparator') or '='} {evaluation.get('expected')!r}, got {evaluation.get('actual')!r}"
+            extra = f" · {evaluation['error']}" if evaluation.get("error") else f" · {evaluation['skipReason']}" if evaluation.get("skipReason") else ""
+            lines.append(f"- {flag} {evaluation['name']}: {detail}{'' if evaluation.get('required', True) else ' (optional)'}{extra}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def render_test_report(report: dict[str, Any]) -> str:

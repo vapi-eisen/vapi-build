@@ -10,7 +10,7 @@ from vapi_build import compile as compiler, extract, ontology, plan, vapi
 from vapi_build.workspace import BuildError
 from .conftest import FakeVapi, valid_ontology, valid_plan
 
-LAUNCHER = Path(__file__).resolve().parents[1] / ".claude" / "skills" / "vapi-build" / "vapi-build"
+LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "vapi-build"
 
 
 def test_key_is_found_in_env_or_config_file_and_never_required_elsewhere(tmp_path):

@@ -1,6 +1,6 @@
 # Writing `ontology/ontology.json`
 
-The ontology is what the domain contains and how its pieces relate, with every record tied to evidence. It is not a prompt, a taxonomy from memory, or a summary of one article. The schema is `vapi_build/schemas/ontology.schema.json`; `check ontology` enforces it plus the rules below.
+The ontology is what the domain contains and how its pieces relate, with every record tied to evidence. It is not a prompt, a taxonomy from memory, or a summary of one article. The schema is `../scripts/vapi_build/schemas/ontology.schema.json` (relative to this guide); `check ontology` enforces it plus the rules below.
 
 ## Read the evidence
 Packets under `evidence/packets/` list segments in this order: API operations, knowledge documents, website pages, transcript batches. Each block of text is preceded by its evidence ID in square brackets, for example `[evidence:kb-refund-policy-02]`. Those IDs are the only citations that exist. Segment titles show the source role and authority.
