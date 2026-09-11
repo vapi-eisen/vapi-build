@@ -300,7 +300,7 @@ def test_render_ontology_and_plan_pages(project):
     write_ontology(project, valid_ontology(extract.load_ledger(project)))
     assert ontology.check_ontology(project)["status"] == "CANDIDATE"
     page = render.render_ontology(project).read_text()
-    assert page.startswith("<title>") and "cdnjs.cloudflare.com/ajax/libs/d3/" in page
+    assert page.startswith('<meta charset="utf-8">\n<title>') and "cdnjs.cloudflare.com/ajax/libs/d3/" in page
     assert "Get a refund" in page and "getSchedule" in page and '"evidence":{' in page
     assert "</script" not in page.split('<script id="data"')[1].split("</script>")[0]  # embedded JSON cannot close the script early
     ontology.approve_ontology(project, by="tester")

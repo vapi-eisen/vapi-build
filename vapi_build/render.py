@@ -557,7 +557,8 @@ def _json_for_script(value: Any) -> str:
 def render_page(model: dict[str, Any]) -> str:
     title = html.escape(model["title"])
     data = _json_for_script(model)
-    return f"""<title>{title}</title>
+    return f"""<meta charset="utf-8">
+<title>{title}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>{CSS}</style>
@@ -665,6 +666,8 @@ button { font: inherit; color: inherit; }
 #graph .node.is-selected circle { stroke:var(--ink); stroke-width:2.5px; }
 #graph .node text { font-size:10px; fill:var(--ink); pointer-events:none; paint-order:stroke; stroke:var(--bg); stroke-width:3px; stroke-linejoin:round; }
 #graph .node.small text { display:none; }
+#graph .node.quiet text { display:none; }
+#graph.zoomed .node.quiet text, #graph .node.quiet.lit-label text { display:block; }
 #view-browse, #view-overview { overflow:auto; }
 #browse, #overview { padding:14px 18px 40px; max-width:980px; }
 .section { margin-bottom:26px; }
@@ -974,12 +977,13 @@ JS = r"""
   const radius = n => Math.min(16, 4 + Math.sqrt(n.weight || 1) * 2.2 + (n.kind === 'goal' || n.kind === 'assistant' ? 3 : 0));
   const sim = d3.forceSimulation(nodes)
     .force('link', d3.forceLink(links).id(d => d.id).distance(l => l.kind === 'instance-of' || l.kind === 'is-a' ? 40 : 70).strength(0.6))
-    .force('charge', d3.forceManyBody().strength(-110))
+    .force('charge', d3.forceManyBody().strength(-140))
     .force('collide', d3.forceCollide().radius(d => radius(d) + 6))
     .force('center', d3.forceCenter(0, 0))
     .force('x', d3.forceX(0).strength(0.03)).force('y', d3.forceY(0).strength(0.03));
   const link = gLinks.selectAll('line').data(links).join('line').attr('class', 'link').attr('stroke-width', l => l.kind === 'serves' || l.kind === 'owns' ? 1.4 : 1);
-  const node = gNodes.selectAll('g').data(nodes).join('g').attr('class', d => 'node' + (radius(d) < 6 ? ' small' : ''))
+  const QUIET = new Set(['type', 'procedure', 'rule', 'claim']);
+  const node = gNodes.selectAll('g').data(nodes).join('g').attr('class', d => 'node' + (radius(d) < 6 ? ' small' : '') + (QUIET.has(d.kind) ? ' quiet' : ''))
     .call(d3.drag().on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.25).restart(); d.fx = d.x; d.fy = d.y; })
       .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; }).on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
   node.append('circle').attr('r', radius).attr('fill', d => color(d.kind));
@@ -992,7 +996,7 @@ JS = r"""
     link.attr('x1', d => d.source.x).attr('y1', d => d.source.y).attr('x2', d => d.target.x).attr('y2', d => d.target.y);
     node.attr('transform', d => `translate(${d.x},${d.y})`);
   });
-  const zoom = d3.zoom().scaleExtent([0.2, 4]).on('zoom', e => { gRoot.attr('transform', e.transform); gNodes.selectAll('g').classed('small', d => radius(d) * e.transform.k < 7); });
+  const zoom = d3.zoom().scaleExtent([0.2, 4]).on('zoom', e => { gRoot.attr('transform', e.transform); svg.classed('zoomed', e.transform.k >= 1.35); gNodes.selectAll('g').classed('small', d => radius(d) * e.transform.k < 7); });
   svg.call(zoom);
   function resize() {
     const box = $('#graph').getBoundingClientRect();
@@ -1001,9 +1005,9 @@ JS = r"""
   }
   window.addEventListener('resize', resize); resize();
   function lit(id) {
-    if (!id) { node.classed('dim', false); link.classed('dim', false).classed('lit', false); return; }
+    if (!id) { node.classed('dim', false).classed('lit-label', false); link.classed('dim', false).classed('lit', false); return; }
     const near = neighbors.get(id) || new Set();
-    node.classed('dim', d => d.id !== id && !near.has(d.id));
+    node.classed('dim', d => d.id !== id && !near.has(d.id)).classed('lit-label', d => d.id === id || near.has(d.id));
     link.classed('lit', l => l.source.id === id || l.target.id === id).classed('dim', l => l.source.id !== id && l.target.id !== id);
   }
   function highlight(id) {
