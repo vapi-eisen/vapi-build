@@ -308,3 +308,58 @@ def approved_ontology(workspace: Workspace) -> dict[str, Any]:
     if candidate["digest"] != approval["digest"]:
         raise BuildError("The ontology changed after approval. Re-check and re-approve it.")
     return candidate
+
+
+FRAGMENT_KEYS = {"domain", "types", "entities", "properties", "relations", "claims", "rules", "procedures", "goals", "capabilities", "observations", "issues", "uncovered"}
+
+
+def merge_fragments(workspace: Workspace) -> dict[str, Any]:
+    """Combine ontology/fragments/*.json (partial ontologies from a packet fan-out) into ontology/ontology.json.
+
+    Purely mechanical: arrays are concatenated, ID collisions are errors, and equal labels under
+    different IDs are reported so the consolidator can merge or distinguish them deliberately.
+    """
+    directory = workspace.path("ontology", "fragments")
+    paths = sorted(directory.glob("*.json")) if directory.exists() else []
+    if not paths:
+        raise BuildError(f"No fragments in {directory}.")
+    merged: dict[str, Any] = {key: [] for key in FRAGMENT_KEYS if key != "domain"}
+    domain = None
+    errors: list[str] = []
+    seen_ids: dict[str, str] = {}
+    for path in paths:
+        fragment = read_json(path)
+        if not isinstance(fragment, dict):
+            errors.append(f"{path.name} is not an object.")
+            continue
+        for key in fragment:
+            if key not in FRAGMENT_KEYS:
+                errors.append(f"{path.name} has unknown key {key!r}.")
+        if isinstance(fragment.get("domain"), dict) and domain is None:
+            domain = fragment["domain"]
+        for key in merged:
+            for record in fragment.get(key, []) or []:
+                identifier = record.get("id") if isinstance(record, dict) else None
+                if key != "uncovered" and identifier:
+                    if identifier in seen_ids:
+                        errors.append(f"{identifier} appears in both {seen_ids[identifier]} and {path.name}.")
+                        continue
+                    seen_ids[identifier] = path.name
+                merged[key].append(record)
+    if domain is None:
+        errors.append("No fragment supplies `domain`.")
+    labels: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for key in ("types", "entities", "goals", "claims"):
+        for record in merged[key]:
+            if isinstance(record, dict) and record.get("id"):
+                labels[(key, str(record.get("label") or record.get("text") or "").casefold())].append(record["id"])
+    duplicates = [f"{key}: {', '.join(ids)}" for (key, _), ids in labels.items() if len(ids) > 1]
+    if errors:
+        return {"status": "REJECTED", "errors": errors, "fragments": [p.name for p in paths]}
+    ontology = {"domain": domain, **{key: merged[key] for key in ("types", "entities", "properties", "relations", "claims", "rules", "procedures", "goals", "capabilities", "observations", "issues", "uncovered")}}
+    for key in ("properties", "relations", "uncovered"):
+        if not ontology[key]:
+            ontology.pop(key)
+    write_json(workspace.path("ontology", "ontology.json"), ontology)
+    return {"status": "MERGED", "fragments": [p.name for p in paths], "counts": {key: len(value) for key, value in ontology.items() if isinstance(value, list)},
+            "possibleDuplicates": duplicates, "errors": []}

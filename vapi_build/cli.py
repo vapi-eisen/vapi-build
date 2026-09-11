@@ -25,7 +25,8 @@ def cmd_doctor(args) -> int:
             print(f"  ok   {module}")
         except ImportError:
             print(f"  MISSING {module}  (pip install {'pyyaml' if module == 'yaml' else module})")
-    print(f"  {'ok  ' if any(os.environ.get(k) for k in vapi.KEY_VARIABLES) else 'unset'} VAPI_API_KEY (needed only for apply/teardown; value is never printed)")
+    _, source = vapi.find_key()
+    print(f"  {'ok  ' if source else 'unset'} Vapi private key" + (f" from {source}" if source else f" (export VAPI_API_KEY or save VAPI_API_KEY=… in {vapi.KEY_FILE}; needed only for apply/test/teardown)"))
     aws = any(os.environ.get(k) for k in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID")) or Path("~/.aws/credentials").expanduser().exists() or Path("~/.aws/config").expanduser().exists()
     print(f"  {'ok  ' if aws else 'unset'} AWS credentials (needed only for s3:// sources)")
     return 0
@@ -155,7 +156,31 @@ def cmd_apply(args) -> int:
         print(f"  {ref} → {identifier}")
     if receipts["squad"].get("id"):
         print(f"  squad → {receipts['squad']['id']}")
-    print("Verified every resource by reading it back. Open the assistant in the Vapi dashboard to talk to it.")
+    print("Verified every resource by reading it back. Next: `test` runs the plan's scenarios through Vapi chat.")
+    return 0
+
+
+def cmd_merge(args) -> int:
+    workspace = _workspace(args)
+    report = ontology.merge_fragments(workspace)
+    print(f"merge: {report['status']} from {len(report['fragments'])} fragments")
+    for error in report.get("errors", []):
+        print(f"  ERROR {error}")
+    for key, value in report.get("counts", {}).items():
+        if value:
+            print(f"  {key}: {value}")
+    for duplicate in report.get("possibleDuplicates", []):
+        print(f"  same label, different ids → merge or distinguish: {duplicate}")
+    if report["status"] == "MERGED":
+        print(f"Wrote {workspace.path('ontology', 'ontology.json')}. Next: review duplicates, then `check ontology`.")
+    return 0 if report["status"] == "MERGED" else 1
+
+
+def cmd_test(args) -> int:
+    workspace = _workspace(args)
+    report = vapi.run_tests(workspace, vapi.client_from_env())
+    print(vapi.render_test_report(report))
+    print(f"Saved {workspace.path('vapi', 'test-results.json')}. Judge each transcript against its expectations and report the verdicts.")
     return 0
 
 
@@ -242,6 +267,14 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "approve":
             p.add_argument("--by", help="who approved (defaults to git user.email)")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("merge", help="combine ontology/fragments/*.json into ontology/ontology.json")
+    p.add_argument("workspace")
+    p.set_defaults(func=cmd_merge)
+
+    p = sub.add_parser("test", help="run the plan's test scenarios against the applied agent through Vapi chat")
+    p.add_argument("workspace")
+    p.set_defaults(func=cmd_test)
 
     p = sub.add_parser("compile", help="write Vapi payloads and knowledge files from the approved plan")
     p.add_argument("workspace")

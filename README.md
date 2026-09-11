@@ -13,18 +13,17 @@ Sources are specified in the conversation, never checked into this repo. Project
 
 ## Use it
 
+Say `/vapi-build` in any Claude Code session and name your material. The skill asks for what it needs (sources and their roles, transcript privacy, the API base URL, audience, auth), then does every step itself and stops only for three yes/no gates: the ontology, the plan with the exact operations the agent may call, and the build. It then creates the Vapi resources and runs the plan's test scenarios through Vapi chat.
+
+The one thing you do by hand, once: save your Vapi private key where the CLI reads it.
+
 ```bash
-cd vapi-build
-python3 -m vapi_build doctor          # jsonschema, PyYAML, boto3; VAPI_API_KEY and AWS presence
+mkdir -p ~/.config/vapi-build && echo 'VAPI_API_KEY=<your private key>' > ~/.config/vapi-build/env && chmod 600 ~/.config/vapi-build/env
 ```
 
-Then in Claude Code, from this directory:
+(Exporting `VAPI_API_KEY` in the shell you start Claude Code from also works.) S3 sources use your default AWS credentials or a profile you name.
 
-```
-/vapi-build Build an agent for Standard Charter. Website https://standardcharter.co, OpenAPI https://standardcharter.co/openapi.json (tools call standardcharter.co), knowledge in s3://…/knowledge/, transcripts in s3://…/calls/ (synthetic).
-```
-
-The skill walks through fetch → extract → ontology (you review and approve) → plan (you approve the exact operations the agent may call) → compile → apply. `apply` needs `VAPI_API_KEY` exported and an explicit yes. `teardown` removes everything the project created.
+The skill is installed for all sessions by symlinking its folder into `~/.claude/skills/vapi-build`; it ships a launcher, `vapi-build`, that runs the CLI from any directory. Inside this repo the same skill is available project-locally.
 
 ## Stages and files
 
@@ -34,7 +33,8 @@ The skill walks through fetch → extract → ontology (you review and approve) 
 | extract | `extract` | `evidence/ledger.json`, `evidence/segments/*.txt`, `evidence/packets/*.md`, `evidence/capabilities.json` |
 | ontology | Claude writes `ontology/ontology.json`; `check`, `summarize`, `approve` | `ontology/candidate.json`, `check.json`, `approval.json` |
 | plan | Claude writes `plan/plan.json`; `check`, `summarize`, `approve` | `plan/candidate.json`, `check.json`, `approval.json` |
-| build | `compile`, `apply --yes`, `verify`, `teardown --yes` | `vapi/build.json`, `vapi/knowledge/`, `vapi/summary.md`, `vapi/receipts.json` |
+| build | `compile`, `apply --yes`, `test`, `verify`, `teardown --yes` | `vapi/build.json`, `vapi/knowledge/`, `vapi/summary.md`, `vapi/receipts.json`, `vapi/test-results.json` |
+| fan-out | subagents write `ontology/fragments/*.json`; `merge` | `ontology/ontology.json` |
 
 Every evidence ID Claude cites is an exact character span in a pinned segment; the checker rejects citations that do not exist, facts that rest only on transcripts, rules without an authoritative source, dangling references, type cycles, and unknown operations. Approvals are bound to content digests, so a changed ontology invalidates the plan and a changed plan invalidates the build.
 

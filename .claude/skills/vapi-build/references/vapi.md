@@ -1,6 +1,6 @@
 # What `compile` and `apply` do in Vapi
 
-`compile` writes `vapi/build.json` (every payload), `vapi/knowledge/` (the files), and `vapi/summary.md`. `apply --yes` executes it against `https://api.vapi.ai` with the private key in `VAPI_API_KEY` (or `VAPI_PRIVATE_KEY`), in this order, writing `vapi/receipts.json` after every step so a rerun resumes instead of duplicating:
+`compile` writes `vapi/build.json` (every payload), `vapi/knowledge/` (the files), and `vapi/summary.md`. `apply --yes` executes it against `https://api.vapi.ai` with the private key found in `VAPI_API_KEY`/`VAPI_PRIVATE_KEY` in the environment or in `~/.config/vapi-build/env` (a `KEY=value` file the user writes themselves), in this order, writing `vapi/receipts.json` after every step so a rerun resumes instead of duplicating:
 
 1. **Credentials**: for each `BEARER_ENV` tool, `POST /credential` with a `custom-credential` bearer plan from the named environment variable.
 2. **Files**: `POST /file` (multipart, `purpose=knowledge-base-v2`) for every knowledge file.
@@ -13,7 +13,7 @@
 `teardown --yes` deletes in reverse (squad, assistants, tools, knowledge base, files, credentials) and removes the receipts.
 
 ## Testing the agent
-Open the assistant (or squad) in the Vapi dashboard and use the talk button, or start a web call with the public key. Run `plan.tests` one by one and note what the agent actually did. A transcript of the call shows tool invocations and their responses; check that write operations were read back and confirmed first.
+`test` sends each plan test to the applied assistant (or squad) through `POST /chat`, chaining `followUps` with `previousChatId`, and saves `vapi/test-results.json`. Judge the transcripts against `expect` and `mustNot` yourself and report per scenario. Chat exercises the model, prompt, knowledge base, and tools, but not voice, so a voice check in the Vapi dashboard (talk button, or a web call with the public key) is still worth one pass. Check that write operations were read back and confirmed before the tool ran.
 
 ## Things to verify on a first live build
 - URL variables (`{{bookingId}}`) resolve from the body properties the model fills; check the tool response in the call log if a path comes through unrendered.

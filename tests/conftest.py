@@ -189,6 +189,10 @@ class FakeVapi:
             self.counter += 1
             self.files.append(f"file_{self.counter}")
             return 201, json.dumps({"id": f"file_{self.counter}", "status": "processing"}).encode()
+        if method == "POST" and path == "/chat":
+            self.counter += 1
+            return 201, json.dumps({"id": f"chat_{self.counter}", "previousChatId": body.get("previousChatId"),
+                                    "output": [{"role": "assistant", "content": f"Reply to: {body['input']}"}]}).encode()
         if method == "POST" and path.startswith("/v2/knowledge-base/") and path.endswith("/file"):
             return 201, json.dumps({"fileId": body["fileId"], "status": "indexing"}).encode()
         if method == "POST":

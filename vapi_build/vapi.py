@@ -11,6 +11,7 @@ import mimetypes
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -79,9 +80,43 @@ class VapiClient:
             return raw.decode("utf-8", errors="replace")
 
 
-def client_from_env(env: dict[str, str] = os.environ, *, transport: Transport = default_transport) -> VapiClient:
-    key = next((env[name] for name in KEY_VARIABLES if env.get(name)), "")
-    return VapiClient(key, base_url=env.get("VAPI_BASE_URL", "https://api.vapi.ai"), transport=transport)
+KEY_FILE = Path("~/.config/vapi-build/env")
+
+
+def load_env_file(path: Path = KEY_FILE) -> dict[str, str]:
+    """Read KEY=value lines (optionally prefixed with `export`). Missing file → empty."""
+    path = path.expanduser()
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def find_key(env: dict[str, str] = os.environ, key_file: Path = KEY_FILE) -> tuple[str, str | None]:
+    """Return (key, where it came from). The key value is never logged by callers."""
+    for name in KEY_VARIABLES:
+        if env.get(name):
+            return env[name], f"environment variable {name}"
+    file_values = load_env_file(key_file)
+    for name in KEY_VARIABLES:
+        if file_values.get(name):
+            return file_values[name], str(key_file)
+    return "", None
+
+
+def client_from_env(env: dict[str, str] = os.environ, *, transport: Transport = default_transport, key_file: Path = KEY_FILE) -> VapiClient:
+    key, source = find_key(env, key_file)
+    if not key:
+        raise BuildError(f"No Vapi private key found. Either export VAPI_API_KEY, or save a line `VAPI_API_KEY=<your private key>` in {key_file} "
+                         "(create the file yourself; do not paste the key into the chat).")
+    base = env.get("VAPI_BASE_URL") or load_env_file(key_file).get("VAPI_BASE_URL") or "https://api.vapi.ai"
+    return VapiClient(key, base_url=base, transport=transport)
 
 
 def load_build(workspace: Workspace) -> dict[str, Any]:
@@ -246,3 +281,61 @@ def teardown(workspace: Workspace, client: VapiClient) -> list[str]:
         remove("credential", receipts["credentials"].pop(ref))
     workspace.path("vapi", "receipts.json").unlink(missing_ok=True)
     return removed
+
+
+def _message_text(message: Any) -> str:
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        content = message.get("content") or message.get("message") or message.get("text") or ""
+        if isinstance(content, list):
+            content = " ".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+        return str(content)
+    return str(message)
+
+
+def run_tests(workspace: Workspace, client: VapiClient) -> dict[str, Any]:
+    """Drive every plan test through Vapi's chat API against the applied assistant or squad.
+
+    Returns transcripts plus each test's expectations; judging whether they were met is left to
+    the reviewer reading them, because expectations are written in plain language.
+    """
+    build = load_build(workspace)
+    receipts = load_receipts(workspace)
+    if not receipts or not receipts.get("verified"):
+        raise BuildError("Apply the build before testing it.")
+    if not build.get("tests"):
+        raise BuildError("The plan declares no tests.")
+    target = {"squadId": receipts["squad"]["id"]} if receipts.get("squad", {}).get("id") else {"assistantId": next(iter(receipts["assistants"].values()))}
+    results = []
+    for test in build["tests"]:
+        turns = []
+        previous_chat = None
+        for utterance in [test["callerOpening"], *test.get("followUps", [])]:
+            body: dict[str, Any] = {**target, "input": utterance, "name": f"vapi-build {test['id']}"[:40]}
+            if previous_chat:
+                body["previousChatId"] = previous_chat
+            chat = client.request("POST", "/chat", body) or {}
+            previous_chat = chat.get("id")
+            outputs = chat.get("output") or []
+            turns.append({"caller": utterance, "agent": [_message_text(m) for m in outputs if not isinstance(m, dict) or m.get("role") in (None, "assistant", "bot")],
+                          "raw": outputs})
+        results.append({"id": test["id"], "scenario": test["scenario"], "expect": test["expect"], "mustNot": test.get("mustNot", []), "turns": turns, "chatId": previous_chat})
+    report = {"testedAt": utc_now(), "target": target, "results": results}
+    write_json(workspace.path("vapi", "test-results.json"), report)
+    return report
+
+
+def render_test_report(report: dict[str, Any]) -> str:
+    lines = [f"# Chat test transcripts ({len(report['results'])} scenarios)", ""]
+    for result in report["results"]:
+        lines.append(f"## {result['scenario']} ({result['id']})")
+        for turn in result["turns"]:
+            lines.append(f"- Caller: {turn['caller']}")
+            for reply in turn["agent"] or ["(no assistant text in output)"]:
+                lines.append(f"  - Agent: {reply}")
+        lines.append(f"- Expect: {'; '.join(result['expect'])}")
+        if result["mustNot"]:
+            lines.append(f"- Must not: {'; '.join(result['mustNot'])}")
+        lines.append("")
+    return "\n".join(lines)
