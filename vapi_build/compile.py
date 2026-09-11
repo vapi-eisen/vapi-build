@@ -113,6 +113,7 @@ def _tool_payload(tool: dict[str, Any], server_url: str) -> dict[str, Any]:
 
 def _job_section(jobs: list[dict[str, Any]], ontology: dict[str, Any], tool_names: dict[str, str]) -> str:
     by_id = {r["id"]: r for group in ("claims", "rules", "procedures", "goals") for r in ontology.get(group, [])}
+    names = {r["id"]: r.get("label") for group in ("types", "entities") for r in ontology.get(group, [])}
     lines = ["# Jobs you handle"]
     for job in jobs:
         goals = ", ".join(by_id[g]["label"] for g in job["goals"] if g in by_id)
@@ -128,7 +129,12 @@ def _job_section(jobs: list[dict[str, Any]], ontology: dict[str, Any], tool_name
             lines.append("Know:")
             for record in knowledge:
                 if "text" in record:
-                    lines.append(f"- {record.get('modality', '').replace('_', ' ') + ': ' if record.get('modality') else ''}{record['text']}")
+                    # A fact must name its subject, or the model attaches the right number to the wrong product.
+                    subject = names.get(record.get("subject", ""), "")
+                    prefix = f"{record['modality'].replace('_', ' ')}: " if record.get("modality") else f"{subject}: " if subject else ""
+                    suffix = f" (when {record['conditions']})" if record.get("conditions") else ""
+                    negative = " [this is NOT the case]" if record.get("polarity") == "NEGATIVE" else ""
+                    lines.append(f"- {prefix}{record['text']}{suffix}{negative}")
                 elif "steps" in record:
                     lines.append(f"- Procedure “{record['label']}”: " + " → ".join(step["instruction"] for step in record["steps"]))
         if job.get("safeguards"):
