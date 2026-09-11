@@ -116,7 +116,7 @@ def test_plan_check_resolves_tools_and_requires_confirmation(project):
     plan.approve_plan(project, by="tester")
 
 
-@pytest.mark.parametrize("mutation", ["privileged", "no-confirm", "undeclared-tool", "unknown-goal", "bearer-no-env", "two-assistants-no-squad", "stale-ontology"])
+@pytest.mark.parametrize("mutation", ["privileged", "no-confirm", "undeclared-tool", "unknown-goal", "bearer-no-env", "reserved-env", "long-name", "two-assistants-no-squad", "stale-ontology"])
 def test_plan_defects_are_rejected(project, mutation):
     approved(project)
     data = valid_plan()
@@ -129,7 +129,11 @@ def test_plan_defects_are_rejected(project, mutation):
     elif mutation == "unknown-goal":
         data["jobs"][0]["goals"] = ["goal:teleport"]
     elif mutation == "bearer-no-env":
-        data["tools"][1]["auth"] = {"mode": "BEARER_ENV"}
+        data["tools"][1]["auth"] = {"mode": "HEADER_ENV"}
+    elif mutation == "reserved-env":
+        data["tools"][1]["auth"] = {"mode": "HEADER_ENV", "env": "VAPI_API_KEY"}
+    elif mutation == "long-name":
+        data["assistants"][0]["name"] = "Harbor Light Ferries Passenger Concierge Desk"
     elif mutation == "two-assistants-no-squad":
         data["assistants"].append({**data["assistants"][0], "id": "second", "name": "Second"})
     project.path("plan", "plan.json").write_text(json.dumps(data))
@@ -140,7 +144,7 @@ def test_plan_defects_are_rejected(project, mutation):
         changed["claims"][0]["text"] = "An adult single fare is 13 dollars."
         write_ontology(project, changed)
         ontology.check_ontology(project)
-        with pytest.raises(BuildError, match="changed after approval"):
+        with pytest.raises(BuildError, match="differs from what was approved|changed"):
             plan.approved_plan(project)
         return
     report = plan.check_plan(project)
@@ -161,38 +165,45 @@ def test_compile_apply_resume_verify_teardown(project, monkeypatch):
     tools = {t["payload"]["name"]: t for t in build["tools"]}
     assert tools["getSchedule"]["payload"]["url"] == "https://ferries.example/public/schedules?route={{route}}"
     assert tools["getBooking"]["payload"]["url"] == "https://ferries.example/bookings/{{bookingId}}"
-    assert tools["getBooking"]["credentialRef"] == "credential:FERRY_TOKEN"
+    assert tools["getBooking"]["secretHeaders"] == [{"name": "Authorization", "env": "FERRY_TOKEN", "prefix": "Bearer "}]
+    assert tools["createBooking"]["secretHeaders"] == [{"name": "X-Ferry-Token", "env": "FERRY_TOKEN", "prefix": ""}]
+    assert tools["createBooking"]["payload"]["headers"]["properties"]["X-Client"]["value"].startswith("vapi-build ")
     assert tools["createBooking"]["payload"]["body"]["required"] == ["route", "passengers"]
+    assert "secret" not in json.dumps(build).casefold().replace("secretheaders", "")
     assert tools["getBooking"]["payload"]["variableExtractionPlan"] == {"aliases": [{"key": "bookingRoute", "value": "{{route}}"}]}
     assistant = build["assistants"][0]["payload"]
     prompt = assistant["model"]["messages"][0]["content"]
     assert "read back every value" in prompt and "Group charters" in prompt and "search the knowledge base" in prompt
+    assert "# Jobs you handle" in prompt and "Read back route, date, and passenger count" in prompt and "Passengers may cancel for a full refund" in prompt
     assert assistant["firstMessage"] == "Harbor Light Ferries, how can I help?" and build["squad"] is None
-    assert build["credentials"] == [{"ref": "credential:FERRY_TOKEN", "env": "FERRY_TOKEN", "name": "harbor-light-ferries-ferry_token", "headerName": "Authorization"}]
+    assert "Callers ask to cancel and be refunded" not in guide, "observations from transcripts stay out of the knowledge base"
     fake = FakeVapi()
     client = vapi.VapiClient("sk-test", transport=fake)
     with pytest.raises(BuildError, match="FERRY_TOKEN"):
-        vapi.apply(project, client, env={}, sleep=lambda s: None)
-    receipts = vapi.apply(project, client, env={"FERRY_TOKEN": "secret-token"}, sleep=lambda s: None)
-    posts = [(m, p) for m, p, _ in fake.calls if m == "POST"]
-    order = [p for _, p in posts]
-    assert order[0] == "/credential"
+        vapi.apply(project, client, secrets={}, sleep=lambda s: None)
+    with pytest.raises(BuildError, match="private key itself"):
+        vapi.apply(project, client, secrets={"FERRY_TOKEN": "sk-test"}, sleep=lambda s: None)
+    assert not fake.calls, "a missing or unsafe token must fail before anything is created"
+    receipts = vapi.apply(project, client, secrets={"FERRY_TOKEN": "secret-token"}, sleep=lambda s: None)
+    order = [p for m, p, _ in fake.calls if m == "POST"]
+    assert "/credential" not in order
     assert order.index("/file") < order.index("/v2/knowledge-base") < order.index("/tool") < order.index("/assistant")
-    credential_call = next(b for m, p, b in fake.calls if p == "/credential")
-    assert credential_call["authenticationPlan"] == {"type": "bearer", "token": "secret-token", "headerName": "Authorization"}
-    assert "secret-token" not in project.path("vapi", "receipts.json").read_text()
+    tool_calls = {b["name"]: b for m, p, b in fake.calls if p == "/tool" and m == "POST"}
+    assert tool_calls["getBooking"]["headers"]["properties"]["Authorization"] == {"type": "string", "value": "Bearer secret-token"}
+    assert tool_calls["createBooking"]["headers"]["properties"]["X-Ferry-Token"] == {"type": "string", "value": "secret-token"}
+    assert "X-Client" in tool_calls["createBooking"]["headers"]["properties"]
+    assert "secret-token" not in project.path("vapi", "receipts.json").read_text() and "secret-token" not in project.path("vapi", "build.json").read_text()
     assistant_call = next(b for m, p, b in fake.calls if p == "/assistant")
     assert assistant_call["model"]["toolIds"][0] == "tool_kb" and len(assistant_call["model"]["toolIds"]) == 4
-    tool_calls = [b for m, p, b in fake.calls if p == "/tool" and m == "POST"]
-    assert any(b.get("credentialId") == receipts["credentials"]["credential:FERRY_TOKEN"] for b in tool_calls)
     assert receipts["verified"] and len(receipts["files"]) == len(build["knowledgeBase"]["files"])
+    assert all(entry["sha256"] for entry in receipts["files"].values())
     before = len(fake.calls)
-    vapi.apply(project, client, env={"FERRY_TOKEN": "secret-token"}, sleep=lambda s: None)
+    vapi.apply(project, client, secrets={"FERRY_TOKEN": "secret-token"}, sleep=lambda s: None)
     assert not [c for c in fake.calls[before:] if c[0] == "POST"], "resume must not create anything twice"
     assert vapi.verify(project, client)
     removed = vapi.teardown(project, client)
     kinds = [r.split(" ")[0] for r in removed]
-    assert kinds.index("assistant") < kinds.index("tool") < kinds.index("v2/knowledge-base") < kinds.index("file") < kinds.index("credential")
+    assert kinds.index("assistant") < kinds.index("tool") < kinds.index("v2/knowledge-base") < kinds.index("file")
     assert not project.path("vapi", "receipts.json").exists()
 
 
@@ -203,7 +214,7 @@ def test_knowledge_tool_falls_back_to_tool_listing(project):
     plan.approve_plan(project, by="tester")
     compiler.compile_build(project)
     fake = FakeVapi(kb_tool_in_get=False)
-    receipts = vapi.apply(project, vapi.VapiClient("sk", transport=fake), env={"FERRY_TOKEN": "t"}, sleep=lambda s: None)
+    receipts = vapi.apply(project, vapi.VapiClient("sk", transport=fake), secrets={"FERRY_TOKEN": "t"}, sleep=lambda s: None)
     assert receipts["knowledgeBase"]["toolId"] == "tool_kb_listed"
 
 
@@ -225,7 +236,7 @@ def test_squad_with_handoffs(project):
     front = build["assistants"][0]["payload"]["model"]
     assert front["tools"][0]["type"] == "handoff" and front["tools"][0]["destinations"][0]["assistantName"] == "Booking Desk"
     fake = FakeVapi()
-    receipts = vapi.apply(project, vapi.VapiClient("sk", transport=fake), env={"FERRY_TOKEN": "t"}, sleep=lambda s: None)
+    receipts = vapi.apply(project, vapi.VapiClient("sk", transport=fake), secrets={"FERRY_TOKEN": "t"}, sleep=lambda s: None)
     squad_call = next(b for m, p, b in fake.calls if p == "/squad")
     assert squad_call["members"][0]["assistantId"] == receipts["assistants"]["assistant:front"]
 
@@ -236,3 +247,48 @@ def test_cli_status_and_guards(project, capsys):
     assert "not checked" in out and "source:website" in out
     assert main(["apply", str(project.root)]) == 1  # refuses without --yes
     assert main(["check", "ontology", str(project.root)]) == 2  # no ontology written yet → BuildError
+
+
+def test_stale_build_and_edited_candidates_are_refused(project):
+    approved(project)
+    project.path("plan", "plan.json").write_text(json.dumps(valid_plan()))
+    plan.check_plan(project)
+    plan.approve_plan(project, by="tester")
+    compiler.compile_build(project)
+    # Gate 2 revisited: drop createBooking, re-check, re-approve, but forget to compile.
+    reduced = valid_plan()
+    reduced["tools"] = [t for t in reduced["tools"] if t["operationId"] != "createBooking"]
+    reduced["jobs"][1]["tools"] = ["getBooking"]
+    reduced["assistants"][0]["tools"] = ["getSchedule", "getBooking"]
+    project.path("plan", "plan.json").write_text(json.dumps(reduced))
+    assert plan.check_plan(project)["status"] == "CANDIDATE"
+    plan.approve_plan(project, by="tester")
+    fake = FakeVapi()
+    with pytest.raises(BuildError, match="compiled from a different plan"):
+        vapi.apply(project, vapi.VapiClient("sk", transport=fake), secrets={"FERRY_TOKEN": "t"}, sleep=lambda s: None)
+    assert not fake.calls
+    compiler.compile_build(project)
+    assert {t["operationId"] for t in read_json(project.path("vapi", "build.json"))["tools"]} == {"getSchedule", "getBooking"}
+    # Hand-editing a candidate without re-checking is caught too.
+    candidate = read_json(project.path("plan", "candidate.json"))
+    candidate["agent"]["purpose"] = "tampered"
+    project.path("plan", "candidate.json").write_text(json.dumps(candidate))
+    with pytest.raises(BuildError, match="differs from what was approved"):
+        plan.approved_plan(project)
+
+
+def test_re_extract_invalidates_ontology_approval(project):
+    approved(project)
+    ontology.approved_ontology(project)
+    import hashlib
+    inventory_path = project.path("raw", "source-knowledge", "inventory.json")
+    inventory = read_json(inventory_path)
+    for item in inventory["items"]:
+        if item["file"].endswith("refund-policy.md"):
+            path = project.path("raw", "source-knowledge", item["file"])
+            path.write_text("# Refund policy\n\n## Cancellations\nEverything changed.\n")
+            item["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    project.path("raw", "source-knowledge", "inventory.json").write_text(json.dumps(inventory))
+    extract.extract_all(project, batch_size=2)
+    with pytest.raises(BuildError, match="evidence changed"):
+        ontology.approved_ontology(project)

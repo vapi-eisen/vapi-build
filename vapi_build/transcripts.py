@@ -11,6 +11,7 @@ from __future__ import annotations
 import codecs
 import csv
 import io
+import itertools
 import json
 import random
 import re
@@ -108,27 +109,53 @@ def conversation_from_row(row: dict[str, str], locator: str, index: int) -> Conv
     return {"id": conversation_id, "locator": locator, "turns": turns, "fields": fields}
 
 
+ROLE_SPEAKERS = ("speaker", "role", "party", "speaker_role", "speaker_name")
+
+
+def _complete_only(items: Iterator[Conversation], lines: Any) -> Iterator[Conversation]:
+    """Hold back one conversation so a scan cut off by the byte budget never yields a partial last one."""
+    pending = None
+    for item in items:
+        if pending is not None:
+            yield pending
+        pending = item
+    if pending is not None and not getattr(lines, "truncated", False):
+        yield pending
+
+
 def conversations_from_csv(lines: Iterable[str], locator: str) -> Iterator[Conversation]:
     reader = csv.DictReader(lines)
-    header = reader.fieldnames or []
-    speaker_col, text_col, id_col = _pick(header, SPEAKER_COLUMNS), _pick(header, TEXT_COLUMNS), _pick(header, ID_COLUMNS)
-    utterance_rows = bool(text_col and id_col and speaker_col)
-    if utterance_rows:
-        current_id, rows = None, []
-        for row in reader:
-            row_id = row.get(id_col) or ""
-            if current_id is not None and row_id != current_id and rows:
-                yield {"id": current_id, "locator": locator, "turns": _turns_from_rows(rows, speaker_col, text_col), "fields": {}}
-                rows = []
-            current_id = row_id
-            rows.append(row)
-        if rows and current_id is not None:
-            yield {"id": current_id, "locator": locator, "turns": _turns_from_rows(rows, speaker_col, text_col), "fields": {}}
+    rows = iter(reader)
+    first = next(rows, None)
+    if first is None:
         return
-    for index, row in enumerate(reader, start=1):
-        conversation = conversation_from_row(row, locator, index)
-        if conversation:
-            yield conversation
+    header = reader.fieldnames or []
+    all_rows = itertools.chain([first], rows)
+    nested = _nested_csv_column(first)
+    speaker_col = _pick(header, ROLE_SPEAKERS) or (_pick(header, ("from",)) if not _pick(header, ("to",)) else None)
+    text_col, id_col = _pick(header, TEXT_COLUMNS), _pick(header, ID_COLUMNS)
+    single_line_text = bool(text_col and "\n" not in (first.get(text_col) or ""))
+    if nested is None and text_col and id_col and speaker_col and single_line_text:
+        def grouped() -> Iterator[Conversation]:
+            current_id, buffered = None, []
+            for row in all_rows:
+                row_id = row.get(id_col) or ""
+                if current_id is not None and row_id != current_id and buffered:
+                    yield {"id": current_id, "locator": locator, "turns": _turns_from_rows(buffered, speaker_col, text_col), "fields": {}}
+                    buffered = []
+                current_id = row_id
+                buffered.append(row)
+            if buffered and current_id is not None:
+                yield {"id": current_id, "locator": locator, "turns": _turns_from_rows(buffered, speaker_col, text_col), "fields": {}}
+        yield from _complete_only(grouped(), lines)
+        return
+
+    def per_row() -> Iterator[Conversation]:
+        for index, row in enumerate(all_rows, start=1):
+            conversation = conversation_from_row(row, locator, index)
+            if conversation:
+                yield conversation
+    yield from _complete_only(per_row(), lines)
 
 
 def conversations_from_json(data: bytes, locator: str) -> list[Conversation]:
@@ -138,10 +165,10 @@ def conversations_from_json(data: bytes, locator: str) -> list[Conversation]:
         loaded = json.loads(text)
         records = loaded if isinstance(loaded, list) else [loaded]
     except json.JSONDecodeError:
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
+        try:
+            records = [json.loads(line) for line in text.splitlines() if line.strip()]
+        except json.JSONDecodeError as error:
+            raise BuildError(f"{locator} is neither JSON nor JSON Lines (line {error.lineno}: {error.msg}).") from error
     conversations = []
     for index, record in enumerate(records, start=1):
         if not isinstance(record, dict):
@@ -209,10 +236,8 @@ def sample_from_objects(objects: list[tuple[str, Callable[[], Any], int]], *, sa
         order = order[: sample * 4]
         notes.append(f"Scanned a seeded subset of {len(order)} of {len(objects)} objects.")
     for locator, opener, size in order:
-        if len(reservoir) >= sample and many_small:
-            break
         handle = opener()
-        name = locator.casefold()
+        name = locator.split("?", 1)[0].casefold()
         if name.endswith(".csv") or (size > 2 * 1024 * 1024 and not name.endswith((".json", ".jsonl", ".txt", ".md"))):
             reader = handle if hasattr(handle, "read") else io.BytesIO(handle)
             lines = _Lines(reader, scan_bytes)
@@ -253,7 +278,7 @@ def scan_conversations(conversations: list[Conversation]) -> dict[str, Any]:
     counts = {name: 0 for name in PII_PATTERNS}
     flagged = 0
     for conversation in conversations:
-        text = conversation_text(conversation)
+        text = conversation_text(conversation) + "\n" + " ".join(str(v) for v in conversation.get("fields", {}).values())
         hit = False
         for name, pattern in PII_PATTERNS.items():
             found = len(pattern.findall(text))

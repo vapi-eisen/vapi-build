@@ -39,7 +39,7 @@ def _built(project):
     compiler.compile_build(project)
     fake = FakeVapi()
     client = vapi.VapiClient("sk", transport=fake)
-    vapi.apply(project, client, env={"FERRY_TOKEN": "t"}, sleep=lambda s: None)
+    vapi.apply(project, client, secrets={"FERRY_TOKEN": "t"}, sleep=lambda s: None)
     return fake, client
 
 
@@ -87,3 +87,19 @@ def test_launcher_runs_from_any_directory(tmp_path):
     link.symlink_to(LAUNCHER.parent)
     result = subprocess.run([str(link / "vapi-build"), "--help"], cwd=tmp_path, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0 and "extract" in result.stdout
+
+
+def test_teardown_keeps_what_vapi_refuses_and_reports_it(project):
+    fake, client = _built(project)
+    original = fake.__call__
+
+    def refusing(method, url, headers, data):
+        if method == "DELETE" and "/assistant/" in url:
+            return 409, b'{"message":"assistant_pinned"}'
+        return original(method, url, headers, data)
+
+    client.transport = refusing
+    with pytest.raises(BuildError, match="refused 1"):
+        vapi.teardown(project, client)
+    receipts = vapi.load_receipts(project)
+    assert receipts is not None and len(receipts["assistants"]) == 1 and not receipts["tools"] and not receipts["files"]

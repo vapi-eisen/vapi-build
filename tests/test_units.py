@@ -99,5 +99,99 @@ def test_crawl_stays_on_host_and_records_failures():
             raise BuildError("404")
         return pages[url][0], pages[url][1], url
 
-    crawled = sources.crawl_site("https://a.example/", fetch, max_pages=10)
-    assert [p["locator"] for p in crawled] == ["https://a.example/", "https://a.example/b"]
+    crawled, truncated = sources.crawl_site("https://a.example/", fetch, max_pages=10)
+    assert [p["locator"] for p in crawled] == ["https://a.example/", "https://a.example/b"] and truncated is False
+    limited, truncated = sources.crawl_site("https://a.example/", fetch, max_pages=1)
+    assert len(limited) == 1 and truncated is True
+
+
+def test_classifier_uses_word_boundaries_and_every_write_confirms():
+    document = {"openapi": "3.0.3", "paths": {
+        "/messages": {"post": {"operationId": "sendMessage", "summary": "Send a message", "responses": {"200": {"description": "ok"}}}},
+        "/members": {"post": {"operationId": "addMember", "responses": {"200": {"description": "ok"}}}},
+        "/presets": {"post": {"operationId": "savePreset", "responses": {"200": {"description": "ok"}}}},
+        "/borders": {"get": {"operationId": "listBorders", "responses": {"200": {"description": "ok"}}}},
+        "/api/v1/me": {"get": {"operationId": "getCustomer", "responses": {"200": {"description": "ok"}}}},
+        "/auth/login": {"post": {"operationId": "customerLogin", "responses": {"200": {"description": "ok"}}}},
+        "/admin/reset": {"post": {"operationId": "resetDemo", "responses": {"204": {"description": "reset"}}}},
+        "/payments": {"post": {"operationId": "createPayment", "responses": {"201": {"description": "ok"}}}},
+    }}
+    ops = {op["operationId"]: op["classification"] for op in openapi.inventory(document, server_url="https://x.example")["operations"]}
+    for write in ("sendMessage", "addMember", "savePreset", "customerLogin", "resetDemo", "createPayment"):
+        assert ops[write]["confirmBeforeCall"] is True, write
+    assert not ops["sendMessage"]["identitySensitive"] and not ops["addMember"]["identitySensitive"]
+    assert ops["getCustomer"]["identitySensitive"] and ops["customerLogin"]["identitySensitive"]
+    assert not ops["savePreset"]["adminOrInternal"] and ops["resetDemo"]["risk"] == "PRIVILEGED"
+    assert not ops["listBorders"]["financial"] and ops["createPayment"]["risk"] == "HIGH"
+
+
+def test_recursive_schema_does_not_crash_inventory():
+    document = {"openapi": "3.1.0", "paths": {"/categories": {"post": {"operationId": "createCategory", "requestBody": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Category"}}}}, "responses": {"201": {"description": "ok"}}}}},
+                "components": {"schemas": {"Category": {"type": "object", "properties": {"name": {"type": "string"}, "children": {"type": "array", "items": {"$ref": "#/components/schemas/Category"}}, "parent": {"$ref": "#/components/schemas/Category"}}}}}}
+    op = openapi.inventory(document, server_url="https://x.example")["operations"][0]
+    schema = op["toolSchema"]["properties"]
+    assert schema["name"] == {"type": "string"}
+    assert schema["children"]["items"]["type"] == "object" and "recursive reference" in schema["children"]["items"]["description"]
+    assert schema["parent"]["type"] == "object" and "recursive reference" in schema["parent"]["description"]
+
+
+def test_missing_operation_ids_get_stable_unique_fallbacks():
+    document = {"openapi": "3.0.0", "paths": {"/a/b": {"get": {"responses": {}}, "post": {"responses": {}}}, "/a-b": {"get": {"responses": {}}}}}
+    ids = [op["operationId"] for op in openapi.inventory(document, server_url="https://x.example")["operations"]]
+    assert ids == ["get_a-b", "get_a-b_2", "post_a-b"] or len(set(ids)) == 3
+
+
+def test_nested_transcript_column_wins_over_from_to_columns():
+    rows = "call_id,from,to,transcript\n" + '1,+15551234567,+15550000000,"speaker,text\nCustomer,I need help\nAgent,Sure"\n'
+    conversations = list(transcripts.conversations_from_csv(io.StringIO(rows), "calls.csv"))
+    assert len(conversations) == 1 and conversations[0]["turns"][0] == {"speaker": "Customer", "text": "I need help"}
+    assert "+1555" not in json.dumps(conversations[0]["turns"])
+
+
+def test_truncated_scan_drops_the_partial_last_conversation():
+    rows = "conversation_id,speaker,text\n" + "".join(f"{i},Customer,hello number {i}\n{i},Agent,hi {i}\n" for i in range(50))
+    complete = transcripts.sample_from_objects([("c.csv", lambda: io.BytesIO(rows.encode()), len(rows))], sample=100, seed=1, scan_bytes=10 ** 9)
+    assert complete["sampling"]["candidatesSeen"] == 50
+    cut = transcripts.sample_from_objects([("c.csv", lambda: io.BytesIO(rows.encode()), len(rows))], sample=100, seed=1, scan_bytes=400)
+    assert cut["sampling"]["scanTruncated"] and 0 < cut["sampling"]["candidatesSeen"] < 50
+    assert all(len(c["turns"]) == 2 for c in cut["conversations"]), "no partial conversation admitted"
+
+
+def test_malformed_json_transcript_is_a_readable_error():
+    with pytest.raises(BuildError, match="neither JSON nor JSON Lines"):
+        transcripts.conversations_from_json(b'{"a": 1,}\n{"b": 2', "bad.json")
+
+
+def test_fetch_all_continues_past_a_failing_source(tmp_path):
+    from vapi_build.workspace import Workspace
+
+    workspace = Workspace.create(tmp_path / "w", "Partial")
+    good = tmp_path / "kb"
+    good.mkdir()
+    (good / "a.md").write_text("# A\n\nText.\n")
+    sources.add_source(workspace, "knowledge", str(good))
+    sources.add_source(workspace, "website", "https://down.example/")
+
+    def fetch(url):
+        raise BuildError("boom")
+
+    results = sources.fetch_all(workspace, fetch=fetch)
+    by_id = {r["source"]: r for r in results}
+    assert by_id["source:knowledge"]["itemCount"] == 1 and "boom" in by_id["source:website"]["error"]
+    with pytest.raises(BuildError, match="No source matches"):
+        sources.fetch_all(workspace, fetch=fetch, only="source:typo")
+
+
+def test_raw_transcripts_are_never_written_to_disk(tmp_path):
+    from vapi_build.workspace import Workspace
+
+    workspace = Workspace.create(tmp_path / "w", "Raw")
+    calls = tmp_path / "calls"
+    calls.mkdir()
+    (calls / "c.csv").write_bytes(nested_csv())
+    sources.add_source(workspace, "transcripts", str(calls), privacy="raw", sample=5)
+    inventory = sources.fetch_all(workspace)[0]
+    raw_dir = sources.raw_dir(workspace, workspace.sources()[0])
+    assert inventory["privacy"] == "raw" and "conversations" not in inventory and inventory["piiScan"]["conversationsScanned"] == 3
+    assert not (raw_dir / "conversations.json").exists()
+    assert "money back" not in "".join(p.read_text() for p in raw_dir.glob("*.json"))

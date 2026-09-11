@@ -9,7 +9,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from .extract import load_ledger
+from .extract import ledger_digest, load_ledger
 from .workspace import BuildError, Workspace, digest_json, read_json, utc_now, write_json
 
 SCHEMA_PATH = Path(__file__).with_name("schemas") / "ontology.schema.json"
@@ -179,10 +179,15 @@ def check_ontology(workspace: Workspace, *, strict: bool = False) -> dict[str, A
                                     "preconditions": record.get("preconditions", ""), "notes": record.get("notes", ""), "enabled": False})
     candidate["capabilities"] = merged_capabilities
     candidate["coverage"] = coverage
-    candidate["ledgerDigest"] = digest_json(ledger)
-    candidate["digest"] = digest_json({k: v for k, v in candidate.items() if k not in {"coverage", "digest"}})
+    candidate["ledgerDigest"] = ledger_digest(ledger)
+    candidate["digest"] = ontology_digest(candidate)
     candidate["checkedAt"] = utc_now()
     return _finish(workspace, ontology, candidate, errors, warnings, coverage, critical)
+
+
+def ontology_digest(candidate: dict[str, Any]) -> str:
+    """Content digest of a checked candidate: everything except the coverage report and run metadata."""
+    return digest_json({k: v for k, v in candidate.items() if k not in {"coverage", "digest", "checkedAt"}})
 
 
 def _finish(workspace: Workspace, ontology: dict[str, Any], candidate: dict[str, Any] | None, errors: list[str], warnings: list[str], coverage: dict[str, Any], critical: list[str] | None = None) -> dict[str, Any]:
@@ -305,8 +310,10 @@ def approved_ontology(workspace: Workspace) -> dict[str, Any]:
         raise BuildError("The ontology has not been approved. Run `approve ontology` after review.")
     approval = read_json(approval_path)
     candidate = load_candidate(workspace)
-    if candidate["digest"] != approval["digest"]:
-        raise BuildError("The ontology changed after approval. Re-check and re-approve it.")
+    if ontology_digest(candidate) != approval["digest"] or candidate.get("digest") != approval["digest"]:
+        raise BuildError("The ontology candidate differs from what was approved. Run `check ontology` and approve it again.")
+    if candidate.get("ledgerDigest") != ledger_digest(load_ledger(workspace)):
+        raise BuildError("The evidence changed after the ontology was approved (a source was re-fetched or re-extracted). Re-check and re-approve the ontology.")
     return candidate
 
 
@@ -346,8 +353,10 @@ def merge_fragments(workspace: Workspace) -> dict[str, Any]:
                         continue
                     seen_ids[identifier] = path.name
                 merged[key].append(record)
+    warnings: list[str] = []
     if domain is None:
-        errors.append("No fragment supplies `domain`.")
+        domain = {"name": workspace.project["name"], "summary": "WRITE ME: one paragraph on what this domain contains."}
+        warnings.append("No fragment supplied `domain`; a placeholder was written. Replace its summary before checking.")
     labels: dict[tuple[str, str], list[str]] = defaultdict(list)
     for key in ("types", "entities", "goals", "claims"):
         for record in merged[key]:
@@ -362,4 +371,4 @@ def merge_fragments(workspace: Workspace) -> dict[str, Any]:
             ontology.pop(key)
     write_json(workspace.path("ontology", "ontology.json"), ontology)
     return {"status": "MERGED", "fragments": [p.name for p in paths], "counts": {key: len(value) for key, value in ontology.items() if isinstance(value, list)},
-            "possibleDuplicates": duplicates, "errors": []}
+            "possibleDuplicates": duplicates, "warnings": warnings, "errors": []}

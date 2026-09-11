@@ -1,6 +1,7 @@
 """Compile the approved plan into exact Vapi payloads and knowledge-base files. No network."""
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 from collections import defaultdict
@@ -15,8 +16,15 @@ from .workspace import BuildError, Workspace, slug, utc_now, write_json
 TEXT_LIKE = {"markdown", "text", "yaml", "json", "csv", "pdf", "docx", "html"}
 
 
+def _display_locator(locator: str) -> str:
+    """Public URLs are cited as-is; local paths and S3 keys are cited by document name only, never by full path."""
+    if locator.startswith("https://") or locator.startswith("http://"):
+        return locator
+    return locator.rstrip("/").rsplit("/", 1)[-1] or locator
+
+
 def _locators(ledger: dict[str, Any]) -> dict[str, str]:
-    segment_locator = {s["id"]: s["locator"] for s in ledger["segments"]}
+    segment_locator = {s["id"]: _display_locator(s["locator"]) for s in ledger["segments"]}
     return {e["id"]: segment_locator[e["segment"]] for e in ledger["evidence"]}
 
 
@@ -75,11 +83,7 @@ def render_domain_guide(ontology: dict[str, Any], ledger: dict[str, Any]) -> str
     for goal in ontology["goals"]:
         phrases = f" Callers say things like: “{'”, “'.join(goal['callerPhrases'][:5])}”." if goal.get("callerPhrases") else ""
         lines.append(f"- **{goal['label']}**: {goal['definition']}{phrases}")
-    if ontology["observations"]:
-        lines += ["", "## Observed in conversations (context, not policy)", ""]
-        for observation in ontology["observations"]:
-            count = f" Seen in {observation['count']} of {observation['sampleSize']} sampled conversations." if "count" in observation and "sampleSize" in observation else ""
-            lines.append(f"- {observation['text']}{count}")
+    # Observations come from transcripts and stay out of the knowledge base by rule.
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -91,6 +95,9 @@ def _tool_payload(tool: dict[str, Any], server_url: str) -> dict[str, Any]:
     payload: dict[str, Any] = {"type": "apiRequest", "name": tool["name"], "description": tool["description"], "method": operation["method"], "url": url}
     if operation["toolSchema"].get("properties"):
         payload["body"] = operation["toolSchema"]
+    if tool.get("headers"):
+        # Fixed or Liquid header values: Vapi reads `value` on a header property and never asks the model for it.
+        payload["headers"] = {"type": "object", "properties": {name: {"type": "string", "value": value} for name, value in tool["headers"].items()}}
     if tool.get("timeoutSeconds"):
         payload["timeoutSeconds"] = tool["timeoutSeconds"]
     if tool.get("startMessage"):
@@ -104,8 +111,40 @@ def _tool_payload(tool: dict[str, Any], server_url: str) -> dict[str, Any]:
     return payload
 
 
-def _system_prompt(assistant: dict[str, Any], plan: dict[str, Any], tools: dict[str, dict[str, Any]]) -> str:
+def _job_section(jobs: list[dict[str, Any]], ontology: dict[str, Any], tool_names: dict[str, str]) -> str:
+    by_id = {r["id"]: r for group in ("claims", "rules", "procedures", "goals") for r in ontology.get(group, [])}
+    lines = ["# Jobs you handle"]
+    for job in jobs:
+        goals = ", ".join(by_id[g]["label"] for g in job["goals"] if g in by_id)
+        lines.append(f"## {job['label']} ({job['handling'].replace('_', ' ').lower()}) — caller goal: {goals}")
+        if job.get("steps"):
+            lines += [f"{index}. {step}" for index, step in enumerate(job["steps"], start=1)]
+        if job.get("slots"):
+            lines.append("Collect: " + "; ".join(f"{slot['name']} ({slot['description']}{', required' if slot.get('required') else ''}{', confirm it back' if slot.get('confirm') else ''})" for slot in job["slots"]))
+        if job.get("tools"):
+            lines.append("Tools: " + ", ".join(tool_names.get(op, op) for op in job["tools"]))
+        knowledge = [by_id[ref] for ref in job.get("knowledge", []) if ref in by_id]
+        if knowledge:
+            lines.append("Know:")
+            for record in knowledge:
+                if "text" in record:
+                    lines.append(f"- {record.get('modality', '').replace('_', ' ') + ': ' if record.get('modality') else ''}{record['text']}")
+                elif "steps" in record:
+                    lines.append(f"- Procedure “{record['label']}”: " + " → ".join(step["instruction"] for step in record["steps"]))
+        if job.get("safeguards"):
+            lines.append("Safeguards: " + " ".join(job["safeguards"]))
+        if job.get("escalation"):
+            lines.append(f"Escalate: {job['escalation']}")
+        for example in job.get("examples", [])[:2]:
+            lines.append(f"Example — caller: “{example['caller']}” → you: “{example['agent']}”")
+    return "\n".join(lines)
+
+
+def _system_prompt(assistant: dict[str, Any], plan: dict[str, Any], tools: dict[str, dict[str, Any]], ontology: dict[str, Any] | None = None) -> str:
     parts = [assistant["systemPrompt"].strip()]
+    jobs = [job for job in plan["jobs"] if job["id"] in set(assistant.get("jobs", []))]
+    if jobs and ontology is not None:
+        parts.append(_job_section(jobs, ontology, {tool["operationId"]: name for name, tool in tools.items()}))
     if assistant.get("knowledge", True):
         parts.append("# Knowledge\nBefore answering a factual question, search the knowledge base and answer only from what it returns. "
                      "If it has nothing relevant, say so plainly and offer the next step; never invent facts, prices, policies, or eligibility.")
@@ -146,16 +185,23 @@ def compile_build(workspace: Workspace) -> dict[str, Any]:
     def unique(name: str) -> str:
         base, ext = (name.rsplit(".", 1) + [""])[:2] if "." in name else (name, "")
         candidate, counter = name, 2
-        while candidate in taken_names:
+        while candidate.casefold() in taken_names:
             candidate = f"{base}-{counter}" + (f".{ext}" if ext else "")
             counter += 1
-        taken_names.add(candidate)
+        taken_names.add(candidate.casefold())
         return candidate
+
+    def record(path_name: str, origin: str, locator: str, **extra: Any) -> None:
+        data = (knowledge_dir / path_name).read_bytes()
+        if not data.strip():
+            (knowledge_dir / path_name).unlink()
+            return
+        files.append({"path": f"knowledge/{path_name}", "name": path_name, "origin": origin, "locator": locator, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), **extra})
 
     if selection["includeDomainGuide"]:
         name = unique(f"{project_slug}-domain-guide.md")
         (knowledge_dir / name).write_text(render_domain_guide(ontology, ledger), encoding="utf-8")
-        files.append({"path": f"knowledge/{name}", "name": name, "origin": "generated", "locator": "ontology"})
+        record(name, "generated", "ontology")
     if selection["includeWebsitePages"]:
         for segment in ledger["segments"]:
             if segment["role"] != "website" or segment["locator"] in excluded:
@@ -163,7 +209,7 @@ def compile_build(workspace: Workspace) -> dict[str, Any]:
             name = unique(f"{segment['id'].split(':', 1)[1]}.md")
             body = f"# {segment['title']}\n\nSource: {segment['locator']}\n\n{segment_text(workspace, segment)}\n"
             (knowledge_dir / name).write_text(body, encoding="utf-8")
-            files.append({"path": f"knowledge/{name}", "name": name, "origin": "website", "locator": segment["locator"]})
+            record(name, "website", segment["locator"])
     if selection["includeSourceDocuments"]:
         for source in workspace.sources("knowledge"):
             inventory = sources.load_inventory(workspace, source)
@@ -177,32 +223,32 @@ def compile_build(workspace: Workspace) -> dict[str, Any]:
                     if segment is None:
                         continue
                     name = unique(slug(original.rsplit(".", 1)[0], 50) + ".md")
-                    (knowledge_dir / name).write_text(f"# {segment['title']}\n\nSource: {segment['locator']}\n\n{segment_text(workspace, segment)}\n", encoding="utf-8")
+                    (knowledge_dir / name).write_text(f"# {segment['title']}\n\nSource: {_display_locator(segment['locator'])}\n\n{segment_text(workspace, segment)}\n", encoding="utf-8")
                 else:
+                    if not item.get("bytes"):
+                        continue
                     name = unique(re.sub(r"[^A-Za-z0-9._-]+", "-", original)[:80] or item["file"])
                     shutil.copyfile(raw / item["file"], knowledge_dir / name)
-                files.append({"path": f"knowledge/{name}", "name": name, "origin": "source", "locator": item["locator"], "kind": item["kind"]})
+                record(name, "source", item["locator"], kind=item["kind"])
     if not files:
         raise BuildError("The plan selects no knowledge files; enable at least the domain guide or source documents.")
 
     server_url = plan["runtime"].get("serverUrl") or ""
     tools_by_name = {tool["name"]: tool for tool in plan["resolvedTools"]}
     by_operation = {tool["operationId"]: tool for tool in plan["resolvedTools"]}
-    credentials: dict[str, dict[str, Any]] = {}
     tool_records = []
     for tool in plan["resolvedTools"]:
-        credential_ref = None
-        if tool["auth"]["mode"] == "BEARER_ENV":
-            credential_ref = f"credential:{tool['auth']['env']}"
-            credentials[credential_ref] = {"ref": credential_ref, "env": tool["auth"]["env"], "name": f"{project_slug}-{tool['auth']['env'].lower()}"[:40],
-                                           "headerName": tool["auth"].get("headerName", "Authorization")}
-        tool_records.append({"ref": f"tool:{tool['name']}", "operationId": tool["operationId"], "payload": _tool_payload(tool, server_url), "credentialRef": credential_ref})
+        secret_headers = []
+        if tool["auth"]["mode"] == "HEADER_ENV":
+            # The value is injected at apply time from the key file; build.json never holds it.
+            secret_headers.append({"name": tool["auth"].get("headerName") or "Authorization", "env": tool["auth"]["env"], "prefix": tool["auth"].get("prefix", "Bearer ")})
+        tool_records.append({"ref": f"tool:{tool['name']}", "operationId": tool["operationId"], "payload": _tool_payload(tool, server_url), "secretHeaders": secret_headers})
 
     assistant_records = []
     names = {assistant["id"]: assistant["name"] for assistant in plan["assistants"]}
     for assistant in plan["assistants"]:
         tool_names = [by_operation[op]["name"] for op in assistant.get("tools", []) if op in by_operation]
-        prompt = _system_prompt({**assistant, "tools": tool_names, "handoffTo": [{**h, "assistant": names[h["assistant"]]} for h in assistant.get("handoffTo", [])]}, plan, tools_by_name)
+        prompt = _system_prompt({**assistant, "tools": tool_names, "handoffTo": [{**h, "assistant": names[h["assistant"]]} for h in assistant.get("handoffTo", [])]}, plan, tools_by_name, ontology)
         model = {**plan["runtime"]["model"], "messages": [{"role": "system", "content": prompt}]}
         if assistant.get("handoffTo"):
             model["tools"] = [{
@@ -232,10 +278,10 @@ def compile_build(workspace: Workspace) -> dict[str, Any]:
                                                         for h in a.get("handoffTo", [])]} for a in ordered]}
     build = {
         "compiledAt": utc_now(), "project": workspace.project["name"], "projectSlug": project_slug,
-        "planDigest": plan["digest"], "ontologyDigest": plan["ontologyDigest"],
+        "planDigest": plan["digest"], "ontologyDigest": plan["ontologyDigest"], "ledgerDigest": ontology["ledgerDigest"],
         "knowledgeBase": {"name": (selection.get("name") or f"{plan['agent']['name']} knowledge")[:80],
                           "description": f"Compiled by vapi-build from {len(files)} files; plan {plan['digest'][:23]}"[:1000], "files": files},
-        "credentials": list(credentials.values()), "tools": tool_records, "assistants": assistant_records, "squad": squad,
+        "tools": tool_records, "assistants": assistant_records, "squad": squad,
         "tests": plan.get("tests", []),
     }
     write_json(out / "build.json", build)
@@ -251,17 +297,20 @@ def render_build_summary(build: dict[str, Any]) -> str:
     lines += ["", f"## Tools ({len(build['tools'])})"]
     for tool in build["tools"]:
         payload = tool["payload"]
-        auth = f" · credential from ${tool['credentialRef'].split(':', 1)[1]}" if tool["credentialRef"] else f" · credentialId {payload['credentialId']}" if payload.get("credentialId") else ""
+        auth = "".join(f" · {h['name']} header from key-file variable {h['env']}" for h in tool.get("secretHeaders", []))
+        if payload.get("credentialId"):
+            auth += f" · credentialId {payload['credentialId']}"
         lines.append(f"- {payload['name']}: {payload['method']} {payload['url']}{auth}")
     lines += ["", f"## Assistants ({len(build['assistants'])})"]
     for assistant in build["assistants"]:
         lines.append(f"- {assistant['payload']['name']}: {len(assistant['toolRefs'])} API tools" + (" + knowledge base" if assistant["knowledge"] else ""))
     if build["squad"]:
         lines.append(f"- Squad “{build['squad']['payload']['name']}” starting with {build['squad']['members'][0]['assistantRef']}")
-    if build["credentials"]:
-        lines += ["", "## Credentials created at apply time (values read from your environment, never stored)"]
-        for credential in build["credentials"]:
-            lines.append(f"- ${credential['env']} → bearer credential “{credential['name']}”")
+    secrets = sorted({h["env"] for tool in build["tools"] for h in tool.get("secretHeaders", [])})
+    if secrets:
+        lines += ["", "## Tokens read from ~/.config/vapi-build/env at apply time (never written to disk here)"]
+        for env in secrets:
+            lines.append(f"- {env}")
     if build["tests"]:
         lines += ["", f"## Test scenarios ({len(build['tests'])})"]
         for test in build["tests"]:

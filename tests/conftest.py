@@ -41,7 +41,7 @@ PAGES = {
             "/admin/reset": {"post": {"operationId": "adminReset", "summary": "Reset the demo database", "responses": {"204": {"description": "reset"}}}},
         },
         "components": {"schemas": {
-            "Schedule": {"type": "object", "properties": {"departures": {"type": "array", "items": {"type": "string"}}}},
+            "Schedule": {"type": "object", "properties": {"departures": {"type": "array", "items": {"type": "string"}}, "next": {"$ref": "#/components/schemas/Schedule"}}},
             "NewBooking": {"type": "object", "required": ["route", "passengers"], "properties": {"route": {"type": "string"}, "passengers": {"type": "integer", "description": "Number of adult passengers"}, "date": {"type": "string", "format": "date"}}},
         }},
     }).encode(), "application/json"),
@@ -157,8 +157,9 @@ def valid_plan() -> dict:
         ],
         "tools": [
             {"operationId": "getSchedule", "description": "Look up departures for a route.", "auth": {"mode": "NONE"}, "startMessage": "Let me check the timetable."},
-            {"operationId": "getBooking", "description": "Fetch a booking by its reference.", "auth": {"mode": "BEARER_ENV", "env": "FERRY_TOKEN"}, "extract": {"bookingRoute": "{{route}}"}},
-            {"operationId": "createBooking", "description": "Create a booking after the passenger confirms.", "auth": {"mode": "BEARER_ENV", "env": "FERRY_TOKEN"}, "confirmBeforeCall": True},
+            {"operationId": "getBooking", "description": "Fetch a booking by its reference.", "auth": {"mode": "HEADER_ENV", "env": "FERRY_TOKEN"}, "extract": {"bookingRoute": "{{route}}"}},
+            {"operationId": "createBooking", "description": "Create a booking after the passenger confirms.", "auth": {"mode": "HEADER_ENV", "env": "FERRY_TOKEN", "headerName": "X-Ferry-Token", "prefix": ""}, "confirmBeforeCall": True,
+             "headers": {"X-Client": "vapi-build {{ \"now\" | date: \"%Y\" }}"}},
         ],
         "knowledge": {"includeSourceDocuments": True, "includeWebsitePages": True, "includeDomainGuide": True},
         "assistants": [{"id": "concierge", "name": "Harbor Light Concierge", "systemPrompt": prompt, "firstMessage": "Harbor Light Ferries, how can I help?",

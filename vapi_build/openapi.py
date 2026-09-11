@@ -10,40 +10,57 @@ import yaml
 from .workspace import BuildError, slug
 
 HTTP_METHODS = ("get", "put", "post", "delete", "patch")
-VAPI_SCHEMA_KEYS = {"type", "items", "properties", "description", "pattern", "format", "required", "enum", "title"}
 VAPI_FORMATS = {"date-time", "time", "date", "duration", "email", "hostname", "ipv4", "ipv6", "uuid"}
+WORD = re.compile(r"[a-z0-9]+")
+ADMIN_WORDS = {"admin", "demoadmin", "reset", "restore", "internal", "debug", "maintenance"}
+DESTRUCTIVE_WORDS = {"delete", "remove", "reset", "close", "cancel", "terminate", "purge", "revoke"}
+FINANCIAL_WORDS = {"transfer", "transfers", "payment", "payments", "pay", "deposit", "deposits", "withdraw", "withdrawal", "withdrawals",
+                   "refund", "refunds", "charge", "charges", "billing", "purchase", "purchases", "order", "orders", "invoice", "invoices"}
+IDENTITY_WORDS = {"auth", "login", "logout", "token", "tokens", "password", "otp", "verify", "verification", "identity", "me", "session", "ticket"}
 
 
-def resolve(document: dict[str, Any], node: Any, depth: int = 0) -> Any:
-    """Inline local $ref pointers recursively (bounded depth to survive cycles)."""
-    if depth > 24:
-        return {"type": "object", "description": "recursive schema truncated"}
+def resolve(document: dict[str, Any], node: Any, _path: tuple[str, ...] = ()) -> Any:
+    """Inline local $ref pointers. A reference already on the expansion path is replaced by a placeholder
+    instead of recursing forever; scalars and plain objects are never altered."""
     if isinstance(node, dict):
-        if "$ref" in node and isinstance(node["$ref"], str):
+        if isinstance(node.get("$ref"), str):
             target = node["$ref"]
+            if target in _path or len(_path) > 32:
+                return {"type": "object", "description": f"recursive reference to {target.rsplit('/', 1)[-1]}"}
             current: Any = document
             for token in target[2:].split("/"):
                 token = token.replace("~1", "/").replace("~0", "~")
                 current = current[token] if isinstance(current, dict) else current[int(token)]
-            merged = copy.deepcopy(current)
+            merged = copy.deepcopy(current) if isinstance(current, dict) else {"value": current}
             for key, value in node.items():
                 if key != "$ref":
                     merged[key] = value
-            return resolve(document, merged, depth + 1)
-        return {key: resolve(document, value, depth + 1) for key, value in node.items()}
+            return resolve(document, merged, _path + (target,))
+        return {key: resolve(document, value, _path) for key, value in node.items()}
     if isinstance(node, list):
-        return [resolve(document, item, depth + 1) for item in node]
+        return [resolve(document, item, _path) for item in node]
     return node
 
 
+def _words(path: str, operation_id: str, operation: dict[str, Any]) -> set[str]:
+    text = " ".join([
+        re.sub(r"[{}]", " ", path),
+        re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", operation_id),
+        str(operation.get("summary") or ""),
+        " ".join(str(tag) for tag in (operation.get("tags") or [])),
+    ]).casefold()
+    return set(WORD.findall(text))
+
+
 def classify(method: str, path: str, operation_id: str, operation: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
-    lowered = f"{path} {operation_id} {operation.get('summary', '')}".casefold()
-    admin = "/admin" in path.casefold() or any(t in lowered for t in ("admin", "reset", "restore", "internal", "debug"))
-    destructive = method == "DELETE" or any(t in lowered for t in ("delete", "remove", "reset", "close", "cancel", "terminate"))
-    financial = any(t in lowered for t in ("transfer", "payment", "pay", "deposit", "withdraw", "refund", "charge", "billing", "purchase", "order"))
-    identity = any(t in lowered for t in ("/auth", "login", "token", "password", "otp", "verify", "identity", "/me"))
+    words = _words(path, operation_id, operation)
+    segments = {segment.casefold() for segment in path.split("/") if segment}
+    admin = bool(words & ADMIN_WORDS) or any(segment.startswith("admin") for segment in segments)
+    destructive = method == "DELETE" or bool(words & DESTRUCTIVE_WORDS)
+    financial = bool(words & FINANCIAL_WORDS)
+    identity = bool(words & IDENTITY_WORDS)
     security = operation.get("security", document.get("security", []))
-    public = not security or "/public/" in path or path in {"/health", "/status"}
+    public = not security or "public" in segments or path in {"/health", "/status"}
     read = method in {"GET", "HEAD"}
     risk = "PRIVILEGED" if admin else "HIGH" if (destructive or financial) else "MEDIUM" if not read else "LOW"
     return {
@@ -56,8 +73,8 @@ def classify(method: str, path: str, operation_id: str, operation: dict[str, Any
         "financial": financial,
         "identitySensitive": identity,
         "risk": risk,
-        # Every write confirms by default; a login-style call is the exception since there is nothing to read back.
-        "confirmBeforeCall": (not read) and not (identity and not (destructive or financial)),
+        # Every non-read operation confirms before the call. A plan may opt one out with a stated reason.
+        "confirmBeforeCall": not read,
     }
 
 
@@ -87,7 +104,9 @@ def _body_schema(operation: dict[str, Any], document: dict[str, Any]) -> dict[st
 
 def _response_schema(operation: dict[str, Any], document: dict[str, Any]) -> dict[str, Any] | None:
     responses = resolve(document, operation.get("responses") or {})
-    for code in sorted(responses):
+    if not isinstance(responses, dict):
+        return None
+    for code in sorted(responses, key=str):
         if str(code).startswith("2") and isinstance(responses[code], dict):
             content = responses[code].get("content") or {}
             for value in content.values():
@@ -97,45 +116,48 @@ def _response_schema(operation: dict[str, Any], document: dict[str, Any]) -> dic
 
 
 def to_vapi_schema(schema: Any, depth: int = 0) -> dict[str, Any]:
-    """Project an arbitrary JSON Schema onto the subset Vapi's JsonSchema accepts."""
+    """Project an arbitrary JSON Schema onto the subset Vapi's JsonSchema accepts. Never raises."""
     if not isinstance(schema, dict) or depth > 12:
         return {"type": "string"}
-    if "allOf" in schema and isinstance(schema["allOf"], list):
+    if isinstance(schema.get("allOf"), list) and schema["allOf"]:
         merged: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
         for part in schema["allOf"]:
             projected = to_vapi_schema(part, depth + 1)
             merged["properties"].update(projected.get("properties", {}))
-            merged["required"] += projected.get("required", [])
+            merged["required"] += [name for name in projected.get("required", []) if name not in merged["required"]]
         if not merged["required"]:
             merged.pop("required")
+        if schema.get("description"):
+            merged["description"] = schema["description"]
         return merged
     for key in ("oneOf", "anyOf"):
-        if key in schema and isinstance(schema[key], list) and schema[key]:
+        if isinstance(schema.get(key), list) and schema[key]:
             first = to_vapi_schema(schema[key][0], depth + 1)
-            first.setdefault("description", schema.get("description", ""))
+            if schema.get("description") and "description" not in first:
+                first["description"] = schema["description"]
             return first
     kind = schema.get("type")
     if isinstance(kind, list):
-        kind = next((k for k in kind if k != "null"), "string")
-    if kind not in {"string", "number", "integer", "boolean", "array", "object"}:
-        kind = "object" if "properties" in schema else "array" if "items" in schema else "string"
+        kind = next((k for k in kind if isinstance(k, str) and k != "null"), "string")
+    if not isinstance(kind, str) or kind not in {"string", "number", "integer", "boolean", "array", "object"}:
+        kind = "object" if isinstance(schema.get("properties"), dict) else "array" if "items" in schema else "string"
     out: dict[str, Any] = {"type": kind}
     for key in ("description", "title", "pattern"):
         if isinstance(schema.get(key), str) and schema[key]:
             out[key] = schema[key]
-    if isinstance(schema.get("enum"), list) and all(isinstance(v, (str, int, float, bool)) for v in schema["enum"]):
+    if isinstance(schema.get("enum"), list) and schema["enum"] and all(isinstance(v, (str, int, float, bool)) for v in schema["enum"]):
         out["enum"] = [str(v) for v in schema["enum"]]
         out["type"] = "string"
     if schema.get("format") in VAPI_FORMATS and out["type"] == "string":
         out["format"] = schema["format"]
     if kind == "object":
-        properties = schema.get("properties") or {}
-        out["properties"] = {name: to_vapi_schema(value, depth + 1) for name, value in properties.items()} if isinstance(properties, dict) else {}
-        required = [name for name in (schema.get("required") or []) if name in out["properties"]]
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        out["properties"] = {str(name): to_vapi_schema(value, depth + 1) for name, value in properties.items()}
+        required = [name for name in (schema.get("required") or []) if isinstance(name, str) and name in out["properties"]]
         if required:
             out["required"] = required
     if kind == "array":
-        out["items"] = to_vapi_schema(schema.get("items") or {"type": "string"}, depth + 1)
+        out["items"] = to_vapi_schema(schema.get("items") if isinstance(schema.get("items"), dict) else {"type": "string"}, depth + 1)
     return out
 
 
@@ -149,13 +171,22 @@ def inventory(document: dict[str, Any], *, server_url: str | None) -> dict[str, 
             operation = path_item.get(method)
             if not isinstance(operation, dict):
                 continue
-            operation_id = str(operation.get("operationId") or "").strip() or f"{method}_{slug(path, 40)}"
+            operation_id = str(operation.get("operationId") or "").strip()
+            if not operation_id:
+                operation_id = f"{method}_{slug(path, 80)}"
+                counter = 2
+                while operation_id in seen_ids:
+                    operation_id = f"{method}_{slug(path, 76)}_{counter}"
+                    counter += 1
             if operation_id in seen_ids:
                 raise BuildError(f"Duplicate operationId in the OpenAPI document: {operation_id}")
             seen_ids.add(operation_id)
-            parameters = _params(path_item, operation, document)
-            body = _body_schema(operation, document)
-            response = _response_schema(operation, document)
+            try:
+                parameters = _params(path_item, operation, document)
+                body = _body_schema(operation, document)
+                response = _response_schema(operation, document)
+            except (KeyError, ValueError, IndexError, TypeError) as error:
+                raise BuildError(f"OpenAPI operation {operation_id} has an unresolvable reference: {error}") from error
             classification = classify(method.upper(), path, operation_id, operation, document)
             tool_properties: dict[str, Any] = {}
             required: list[str] = []
@@ -182,7 +213,9 @@ def inventory(document: dict[str, Any], *, server_url: str | None) -> dict[str, 
             query_names = [p["name"] for p in parameters if p["in"] == "query"]
             path_names = [p["name"] for p in parameters if p["in"] == "path"]
             body_names = [name for name in tool_properties if name not in query_names and name not in path_names]
+            capability_id = f"capability:{slug(operation_id, 60)}"
             text = yaml.safe_dump({
+                "capability": capability_id,
                 "operationId": operation_id, "method": method.upper(), "path": path,
                 "summary": operation.get("summary"), "description": operation.get("description"), "tags": operation.get("tags"),
                 "security": operation.get("security", document.get("security")),
@@ -190,7 +223,7 @@ def inventory(document: dict[str, Any], *, server_url: str | None) -> dict[str, 
                 "requestBody": body, "response": response,
             }, sort_keys=False, allow_unicode=True, width=100).strip()
             operations.append({
-                "id": f"capability:{slug(operation_id, 60)}",
+                "id": capability_id,
                 "operationId": operation_id, "method": method.upper(), "path": path,
                 "summary": operation.get("summary") or "", "description": operation.get("description") or "",
                 "tags": operation.get("tags") or [],
@@ -202,6 +235,8 @@ def inventory(document: dict[str, Any], *, server_url: str | None) -> dict[str, 
             })
     if not operations:
         raise BuildError("The OpenAPI document declares no operations.")
+    if len({op["id"] for op in operations}) != len(operations):
+        raise BuildError("Two operationIds collapse to the same capability ID after normalization; rename one in the spec.")
     return {"openapiVersion": str(document.get("openapi")), "title": (document.get("info") or {}).get("title", ""), "serverUrl": server_url,
             "operationCount": len(operations), "operations": operations}
 

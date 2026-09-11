@@ -17,6 +17,7 @@ import socket
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -97,11 +98,18 @@ def default_fetch(url: str) -> tuple[bytes, str, str]:
         "Accept": "text/html,application/json,application/yaml,text/yaml,text/markdown,text/plain;q=0.9,*/*;q=0.5",
         "User-Agent": "vapi-build/0.1 (+https://vapi.ai)",
     })
-    with build_opener(_SafeRedirects()).open(request, timeout=20) as response:  # noqa: S310 - public HTTPS only
-        body = response.read(MAX_HTTP_BYTES + 1)
-        if len(body) > MAX_HTTP_BYTES:
-            raise BuildError(f"{url} exceeds the {MAX_HTTP_BYTES // (1024 * 1024)} MB fetch limit.")
-        return body, response.headers.get_content_type(), response.geturl()
+    try:
+        with build_opener(_SafeRedirects()).open(request, timeout=20) as response:  # noqa: S310 - public HTTPS only
+            body = response.read(MAX_HTTP_BYTES + 1)
+            if len(body) > MAX_HTTP_BYTES:
+                raise BuildError(f"{url} exceeds the {MAX_HTTP_BYTES // (1024 * 1024)} MB fetch limit.")
+            return body, response.headers.get_content_type(), response.geturl()
+    except HTTPError as error:
+        raise BuildError(f"{url} returned HTTP {error.code}.") from error
+    except URLError as error:
+        raise BuildError(f"{url} could not be fetched: {error.reason}") from error
+    except (TimeoutError, socket.timeout) as error:
+        raise BuildError(f"{url} timed out.") from error
 
 
 # --------------------------------------------------------------------------- registration
@@ -163,12 +171,14 @@ class _Links(HTMLParser):
                 self.links.append(href)
 
 
-def crawl_site(start_url: str, fetch: Fetch, *, max_pages: int = 40, allowed_hosts: Iterable[str] | None = None) -> list[dict[str, Any]]:
-    """Breadth-first crawl of same-host pages. Page bytes are kept exactly as fetched."""
+def crawl_site(start_url: str, fetch: Fetch, *, max_pages: int = 40, allowed_hosts: Iterable[str] | None = None) -> tuple[list[dict[str, Any]], bool]:
+    """Breadth-first crawl of same-host pages. Page bytes are kept exactly as fetched.
+    Returns (pages, truncated); failed fetches are recorded but do not count toward the page budget."""
     start, host = normalize_https(start_url)
     allowed = {h.casefold() for h in (allowed_hosts or [])} | {host}
     queue, seen, pages = [start], set(), []
-    while queue and len(pages) < max_pages:
+    fetched = 0
+    while queue and fetched < max_pages:
         url = queue.pop(0)
         key = url.split("#")[0]
         if key in seen:
@@ -186,6 +196,7 @@ def crawl_site(start_url: str, fetch: Fetch, *, max_pages: int = 40, allowed_hos
         if final_host not in allowed:
             continue
         pages.append({"locator": final_url, "bytes": body, "contentType": content_type})
+        fetched += 1
         if kind_of(final_url, content_type) != "html":
             continue
         parser = _Links()
@@ -200,7 +211,7 @@ def crawl_site(start_url: str, fetch: Fetch, *, max_pages: int = 40, allowed_hos
             clean = urlunsplit(("https", parsed.netloc.casefold(), parsed.path or "/", parsed.query, ""))
             if clean not in seen and clean not in queue:
                 queue.append(clean)
-    return pages
+    return pages, bool(queue)
 
 
 def parse_openapi(data: bytes, *, document_url: str | None = None, server_url: str | None = None) -> dict[str, Any]:
@@ -240,9 +251,17 @@ def parse_openapi(data: bytes, *, document_url: str | None = None, server_url: s
                 current = current[int(token)]
             else:
                 raise BuildError(f"OpenAPI reference does not resolve: {reference}")
-    servers = [item.get("url") for item in document.get("servers") or [] if isinstance(item, dict) and item.get("url")]
+    servers = []
+    for item in document.get("servers") or []:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        url = str(item["url"])
+        for name, variable in (item.get("variables") or {}).items():
+            if isinstance(variable, dict) and variable.get("default") is not None:
+                url = url.replace("{" + str(name) + "}", str(variable["default"]))
+        servers.append(url)
     resolved_server = server_url
-    if not resolved_server and servers:
+    if not resolved_server and servers and "{" not in str(servers[0]):
         first = str(servers[0])
         if re.match(r"^https?://", first):
             resolved_server = first
@@ -302,10 +321,25 @@ def _store(raw: Path, index: int, locator: str, data: bytes, content_type: str =
 
 
 def fetch_source(workspace: Workspace, source: dict[str, Any], *, fetch: Fetch = default_fetch, s3_factory: Callable[[], Any] | None = None) -> dict[str, Any]:
-    raw = raw_dir(workspace, source)
+    final = raw_dir(workspace, source)
+    raw = final.with_name(final.name + ".fetching")
     if raw.exists():
         shutil.rmtree(raw)
     raw.mkdir(parents=True)
+    try:
+        inventory = _fetch_into(workspace, source, raw, fetch, s3_factory)
+    except BaseException:
+        shutil.rmtree(raw, ignore_errors=True)
+        raise
+    if final.exists():
+        shutil.rmtree(final)
+    raw.rename(final)
+    source["fetched"] = {"at": inventory["fetchedAt"], "itemCount": inventory["itemCount"], "byteCount": inventory["byteCount"], "notes": inventory["notes"]}
+    workspace.save()
+    return inventory
+
+
+def _fetch_into(workspace: Workspace, source: dict[str, Any], raw: Path, fetch: Fetch, s3_factory: Callable[[], Any] | None) -> dict[str, Any]:
     role, kind, location, options = source["role"], source["locationKind"], source["location"], source.get("options", {})
     items: list[dict[str, Any]] = []
     notes: list[str] = []
@@ -314,14 +348,16 @@ def fetch_source(workspace: Workspace, source: dict[str, Any], *, fetch: Fetch =
     if role == "website":
         if kind != "https":
             raise BuildError("A website source must be an HTTPS URL.")
-        pages = crawl_site(location, fetch, max_pages=int(options.get("maxPages", 40)), allowed_hosts=options.get("allowedHosts"))
-        for index, page in enumerate(pages, start=1):
+        pages, truncated = crawl_site(location, fetch, max_pages=int(options.get("maxPages", 40)), allowed_hosts=options.get("allowedHosts"))
+        for page in pages:
             if "error" in page:
                 notes.append(f"{page['locator']}: {page['error']}")
                 continue
-            items.append(_store(raw, index, page["locator"], page["bytes"], page["contentType"]))
-        if len(items) >= int(options.get("maxPages", 40)):
+            items.append(_store(raw, len(items) + 1, page["locator"], page["bytes"], page["contentType"]))
+        if truncated:
             notes.append(f"Crawl stopped at the page limit ({len(items)} pages); raise --max-pages to include more.")
+        if not items:
+            raise BuildError(f"No page of {location} could be fetched: {notes[0] if notes else 'nothing was returned'}")
     elif role == "openapi":
         if kind == "https":
             data, content_type, final_url = fetch(location)
@@ -383,9 +419,13 @@ def fetch_source(workspace: Workspace, source: dict[str, Any], *, fetch: Fetch =
                 raise BuildError(f"No objects under {location}.")
             objects = [(f"s3://{bucket}/{e['key']}", (lambda key=e["key"]: client.get_object(Bucket=bucket, Key=key)["Body"]), e["bytes"]) for e in listed]
             result = transcripts.sample_from_objects(objects, sample=sample, seed=seed, scan_bytes=scan_bytes)
-        write_json(raw / "conversations.json", result["conversations"])
-        extra = {"sampling": result["sampling"], "conversations": "conversations.json", "privacy": source["privacy"],
-                 "piiScan": transcripts.scan_conversations(result["conversations"])}
+        scan = transcripts.scan_conversations(result["conversations"])
+        extra = {"sampling": result["sampling"], "privacy": source["privacy"], "piiScan": scan}
+        if source["privacy"] == "raw":
+            notes.append("Attested raw: conversation text was scanned in memory and discarded; only counts and digests are kept.")
+        else:
+            write_json(raw / "conversations.json", result["conversations"])
+            extra["conversations"] = "conversations.json"
         notes.extend(result["notes"])
         items = [{"id": f"conv-{i:04d}", "locator": c["locator"], "kind": "conversation", "bytes": len(transcripts.conversation_text(c)),
                   "sha256": hashlib.sha256(transcripts.conversation_text(c).encode("utf-8")).hexdigest()} for i, c in enumerate(result["conversations"], start=1)]
@@ -393,16 +433,26 @@ def fetch_source(workspace: Workspace, source: dict[str, Any], *, fetch: Fetch =
     inventory = {"source": source["id"], "role": role, "location": location, "fetchedAt": utc_now(), "itemCount": len(items),
                  "byteCount": sum(int(item.get("bytes", 0)) for item in items), "items": items, "notes": notes, **extra}
     write_json(raw / "inventory.json", inventory)
-    source["fetched"] = {"at": inventory["fetchedAt"], "itemCount": len(items), "byteCount": inventory["byteCount"], "notes": notes}
-    workspace.save()
     return inventory
 
 
 def fetch_all(workspace: Workspace, *, fetch: Fetch = default_fetch, s3_factory: Callable[[], Any] | None = None, only: str | None = None) -> list[dict[str, Any]]:
-    sources = [s for s in workspace.sources() if only is None or s["id"] == only or s["role"] == only]
-    if not sources:
+    """Fetch every registered source. One failing source is reported, not fatal; all failing is."""
+    registered = workspace.sources()
+    if not registered:
         raise BuildError("No sources registered. Add at least one with `add`.")
-    return [fetch_source(workspace, source, fetch=fetch, s3_factory=s3_factory) for source in sources]
+    sources = [s for s in registered if only is None or s["id"] == only or s["role"] == only]
+    if not sources:
+        raise BuildError(f"No source matches --only {only}; registered: {', '.join(s['id'] for s in registered)}")
+    results = []
+    for source in sources:
+        try:
+            results.append(fetch_source(workspace, source, fetch=fetch, s3_factory=s3_factory))
+        except BuildError as error:
+            results.append({"source": source["id"], "role": source["role"], "location": source["location"], "error": str(error), "itemCount": 0, "byteCount": 0, "notes": []})
+    if all("error" in result for result in results):
+        raise BuildError("Every source failed to fetch: " + "; ".join(f"{r['source']}: {r['error']}" for r in results))
+    return results
 
 
 def load_inventory(workspace: Workspace, source: dict[str, Any]) -> dict[str, Any]:

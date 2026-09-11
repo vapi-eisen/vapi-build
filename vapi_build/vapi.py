@@ -136,23 +136,39 @@ def _save(workspace: Workspace, receipts: dict[str, Any]) -> None:
     write_json(workspace.path("vapi", "receipts.json"), receipts)
 
 
-def apply(workspace: Workspace, client: VapiClient, *, env: dict[str, str] = os.environ, sleep: Callable[[float], None] = time.sleep,
+def _check_build_is_current(workspace: Workspace, build: dict[str, Any]) -> None:
+    from .plan import approved_plan  # local import: plan depends on this module for key constants
+
+    approved = approved_plan(workspace)
+    if build["planDigest"] != approved["digest"] or build["ontologyDigest"] != approved["ontologyDigest"]:
+        raise BuildError("vapi/build.json was compiled from a different plan than the one approved. Run `compile` again.")
+    from .extract import ledger_digest, load_ledger
+
+    if build.get("ledgerDigest") != ledger_digest(load_ledger(workspace)):
+        raise BuildError("The evidence changed after this build was compiled. Re-check the ontology and plan, then `compile` again.")
+
+
+def apply(workspace: Workspace, client: VapiClient, *, secrets: dict[str, str] | None = None, sleep: Callable[[float], None] = time.sleep,
           poll_seconds: float = 5.0, timeout_seconds: float = 600.0) -> dict[str, Any]:
     build = load_build(workspace)
-    receipts = load_receipts(workspace) or {"planDigest": build["planDigest"], "startedAt": utc_now(), "credentials": {}, "files": {}, "knowledgeBase": {}, "tools": {}, "assistants": {}, "squad": {}, "verified": False}
+    _check_build_is_current(workspace, build)
+    secrets = load_env_file() if secrets is None else secrets
+    receipts = load_receipts(workspace) or {"planDigest": build["planDigest"], "startedAt": utc_now(), "files": {}, "knowledgeBase": {}, "tools": {}, "assistants": {}, "squad": {}, "verified": False}
     if receipts["planDigest"] != build["planDigest"]:
         raise BuildError("Receipts belong to a different build. Run `teardown` before applying a new plan, or delete vapi/receipts.json if those resources are already gone.")
+    for file in build["knowledgeBase"]["files"]:
+        previous = receipts["files"].get(file["path"])
+        if previous and previous.get("sha256") != file["sha256"]:
+            raise BuildError(f"{file['name']} changed since it was uploaded. Run `teardown --yes` and then `apply --yes` to rebuild the knowledge base.")
 
-    for credential in build["credentials"]:
-        if credential["ref"] in receipts["credentials"]:
-            continue
-        token = env.get(credential["env"])
-        if not token:
-            raise BuildError(f"Environment variable {credential['env']} is not set; it must hold the bearer token for the API.")
-        created = client.request("POST", "/credential", {"provider": "custom-credential", "name": credential["name"],
-                                                         "authenticationPlan": {"type": "bearer", "token": token, "headerName": credential["headerName"]}})
-        receipts["credentials"][credential["ref"]] = created["id"]
-        _save(workspace, receipts)
+    # Resolve every secret header before touching Vapi, so a missing token fails with nothing created.
+    for tool in build["tools"]:
+        for header in tool.get("secretHeaders", []):
+            token = secrets.get(header["env"])
+            if not token:
+                raise BuildError(f"{header['env']} is not set in {KEY_FILE}. Ask the user to add a line `{header['env']}=<token>` to that file.")
+            if token == client._key:
+                raise BuildError(f"{header['env']} holds the Vapi private key itself; a tool must never forward it. Use the API's own token.")
 
     for file in build["knowledgeBase"]["files"]:
         if file["path"] in receipts["files"]:
@@ -161,7 +177,7 @@ def apply(workspace: Workspace, client: VapiClient, *, env: dict[str, str] = os.
         created = client.upload(file["name"], data, metadata={"managedBy": "vapi-build", "project": build["projectSlug"], "origin": file["origin"]})
         if not created or not created.get("id") or created.get("status") == "failed":
             raise BuildError(f"Vapi did not accept {file['name']}.")
-        receipts["files"][file["path"]] = created["id"]
+        receipts["files"][file["path"]] = {"id": created["id"], "sha256": file["sha256"]}
         _save(workspace, receipts)
 
     if not receipts["knowledgeBase"].get("id"):
@@ -169,22 +185,24 @@ def apply(workspace: Workspace, client: VapiClient, *, env: dict[str, str] = os.
         receipts["knowledgeBase"] = {"id": created["id"], "attached": [], "toolId": created.get("toolId")}
         _save(workspace, receipts)
     knowledge_base_id = receipts["knowledgeBase"]["id"]
-    for path, file_id in receipts["files"].items():
+    file_ids = [entry["id"] for entry in receipts["files"].values()]
+    for file_id in file_ids:
         if file_id in receipts["knowledgeBase"]["attached"]:
             continue
         client.request("POST", f"/v2/knowledge-base/{knowledge_base_id}/file", {"fileId": file_id})
         receipts["knowledgeBase"]["attached"].append(file_id)
         _save(workspace, receipts)
     if not receipts["knowledgeBase"].get("toolId"):
-        receipts["knowledgeBase"]["toolId"] = _wait_for_knowledge(client, knowledge_base_id, list(receipts["files"].values()), sleep, poll_seconds, timeout_seconds)
+        receipts["knowledgeBase"]["toolId"] = _wait_for_knowledge(client, knowledge_base_id, file_ids, sleep, poll_seconds, timeout_seconds)
         _save(workspace, receipts)
 
     for tool in build["tools"]:
         if tool["ref"] in receipts["tools"]:
             continue
-        payload = dict(tool["payload"])
-        if tool["credentialRef"]:
-            payload["credentialId"] = receipts["credentials"][tool["credentialRef"]]
+        payload = json.loads(json.dumps(tool["payload"]))
+        for header in tool.get("secretHeaders", []):
+            headers = payload.setdefault("headers", {"type": "object", "properties": {}})
+            headers["properties"][header["name"]] = {"type": "string", "value": f"{header['prefix']}{secrets[header['env']]}"}
         created = client.request("POST", "/tool", payload)
         receipts["tools"][tool["ref"]] = created["id"]
         _save(workspace, receipts)
@@ -256,29 +274,40 @@ def verify(workspace: Workspace, client: VapiClient, receipts: dict[str, Any] | 
 
 
 def teardown(workspace: Workspace, client: VapiClient) -> list[str]:
+    """Delete everything in the receipts, in dependency order. A resource Vapi refuses to delete is
+    reported and kept in the receipts; everything else is still removed."""
     receipts = load_receipts(workspace)
     if not receipts:
         raise BuildError("No receipts; nothing to remove.")
-    removed = []
+    removed: list[str] = []
+    kept: list[str] = []
 
-    def remove(kind: str, identifier: str) -> None:
-        client.request("DELETE", f"/{kind}/{identifier}", allow_404=True)
+    def remove(kind: str, identifier: str) -> bool:
+        try:
+            client.request("DELETE", f"/{kind}/{identifier}", allow_404=True)
+        except BuildError as error:
+            kept.append(f"{kind} {identifier}: {error}")
+            return False
         removed.append(f"{kind} {identifier}")
-        _save(workspace, receipts)
+        return True
 
-    if receipts["squad"].get("id"):
-        remove("squad", receipts["squad"].pop("id"))
+    if receipts["squad"].get("id") and remove("squad", receipts["squad"]["id"]):
+        receipts["squad"] = {}
     for ref in list(receipts["assistants"]):
-        remove("assistant", receipts["assistants"].pop(ref))
+        if remove("assistant", receipts["assistants"][ref]):
+            receipts["assistants"].pop(ref)
     for ref in list(receipts["tools"]):
-        remove("tool", receipts["tools"].pop(ref))
-    if receipts["knowledgeBase"].get("id"):
-        remove("v2/knowledge-base", receipts["knowledgeBase"]["id"])
+        if remove("tool", receipts["tools"][ref]):
+            receipts["tools"].pop(ref)
+    if receipts["knowledgeBase"].get("id") and remove("v2/knowledge-base", receipts["knowledgeBase"]["id"]):
         receipts["knowledgeBase"] = {}
     for path in list(receipts["files"]):
-        remove("file", receipts["files"].pop(path))
-    for ref in list(receipts["credentials"]):
-        remove("credential", receipts["credentials"].pop(ref))
+        entry = receipts["files"][path]
+        if remove("file", entry["id"] if isinstance(entry, dict) else entry):
+            receipts["files"].pop(path)
+    if kept:
+        _save(workspace, receipts)
+        raise BuildError(f"Removed {len(removed)} resources; Vapi refused {len(kept)}: " + "; ".join(kept) + ". They stay in vapi/receipts.json; delete them in the dashboard and run teardown again.")
     workspace.path("vapi", "receipts.json").unlink(missing_ok=True)
     return removed
 
@@ -301,11 +330,14 @@ def run_tests(workspace: Workspace, client: VapiClient) -> dict[str, Any]:
     the reviewer reading them, because expectations are written in plain language.
     """
     build = load_build(workspace)
+    _check_build_is_current(workspace, build)
     receipts = load_receipts(workspace)
     if not receipts or not receipts.get("verified"):
         raise BuildError("Apply the build before testing it.")
     if not build.get("tests"):
-        raise BuildError("The plan declares no tests.")
+        report = {"testedAt": utc_now(), "target": None, "results": [], "note": "The plan declares no tests."}
+        write_json(workspace.path("vapi", "test-results.json"), report)
+        return report
     target = {"squadId": receipts["squad"]["id"]} if receipts.get("squad", {}).get("id") else {"assistantId": next(iter(receipts["assistants"].values()))}
     results = []
     for test in build["tests"]:

@@ -62,8 +62,12 @@
       "properties": {
         "operationId": {"$ref": "#/$defs/text"}, "name": {"type": "string", "pattern": "^[a-zA-Z0-9_-]{1,40}$"}, "description": {"$ref": "#/$defs/text"},
         "auth": {"type": "object", "additionalProperties": false, "required": ["mode"],
-                 "properties": {"mode": {"enum": ["NONE", "VAPI_CREDENTIAL", "BEARER_ENV"]}, "credentialId": {"type": "string"}, "env": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"}, "headerName": {"type": "string"}}},
+                 "properties": {"mode": {"enum": ["NONE", "VAPI_CREDENTIAL", "HEADER_ENV"]}, "credentialId": {"type": "string", "minLength": 1},
+                                "env": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,63}$"}, "headerName": {"type": "string", "pattern": "^[A-Za-z0-9-]{1,64}$"},
+                                "prefix": {"type": "string", "maxLength": 40}}},
+        "headers": {"type": "object", "propertyNames": {"pattern": "^[A-Za-z0-9-]{1,64}$"}, "additionalProperties": {"type": "string", "maxLength": 2000}},
         "confirmBeforeCall": {"type": "boolean"},
+        "skipConfirmationReason": {"type": "string", "minLength": 8, "maxLength": 300},
         "startMessage": {"type": "string", "maxLength": 300},
         "extract": {"type": "object", "additionalProperties": {"type": "string"}, "propertyNames": {"pattern": "^[a-zA-Z][a-zA-Z0-9_]{0,39}$"}},
         "staticParameters": {"type": "object"},
@@ -74,7 +78,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["id", "name", "systemPrompt", "jobs"],
       "properties": {
-        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,40}$"}, "name": {"type": "string", "minLength": 1, "maxLength": 60},
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,40}$"}, "name": {"type": "string", "minLength": 1, "maxLength": 40},
         "systemPrompt": {"type": "string", "minLength": 40}, "firstMessage": {"type": "string"},
         "jobs": {"type": "array", "items": {"type": "string", "pattern": "^job:[a-z][a-z0-9-]{0,95}$"}},
         "tools": {"type": "array", "items": {"$ref": "#/$defs/text"}}, "knowledge": {"type": "boolean"},

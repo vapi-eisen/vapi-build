@@ -25,7 +25,9 @@ Work packet by packet. For large corpora, keep `ontology/notes.md` with candidat
 | `issues` | conflicts, ambiguity, missing evidence, gaps | `id`, `kind`, `severity`, `description`; optional `records`, `evidence` |
 | `uncovered` (optional) | segments you deliberately did not use | `segment`, `reason` |
 
-IDs are `prefix:lower-kebab` and unique across the file: `type:crossing`, `entity:harbor-star`, `claim:adult-fare`, `step:show-reference`. Capability IDs are fixed by the host: `capability:<operationid>` lowercased, listed in `evidence/capabilities.json`.
+IDs are `prefix:lower-kebab` and unique across the file: `type:crossing`, `entity:harbor-star`, `claim:adult-fare`, `step:show-reference`. Capability IDs are fixed by the host and printed at the top of each API operation segment (`capability: capability:...`) and in `evidence/capabilities.json`; copy them, do not derive them.
+
+Enumerations: `status` is EXPLICIT, INFERRED, or HYPOTHESIS; claim `polarity` is POSITIVE or NEGATIVE; rule `modality` is MUST, MUST_NOT, SHOULD, SHOULD_NOT, or MAY; property `valueKind` is string, number, boolean, date, or reference; issue `kind` is CONFLICT, AMBIGUITY, MISSING_EVIDENCE, UNSUPPORTED_INFERENCE, COVERAGE_GAP, CAPABILITY_GAP, or FRAMEWORK_GAP with `severity` INFO, WARNING, or CRITICAL. The arrays `types`, `entities`, `claims`, `rules`, `procedures`, `goals`, `capabilities`, `observations`, and `issues` are all required, empty or not; `properties`, `relations`, and `uncovered` are optional. No other keys are allowed anywhere.
 
 ## Rules the checker enforces
 - Every `evidence` entry must exist in the ledger. Every referenced record must exist and be of the right kind.

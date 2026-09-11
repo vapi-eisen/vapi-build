@@ -8,7 +8,10 @@ from jsonschema import Draft202012Validator
 
 from . import openapi
 from .ontology import approved_ontology, approver, load_capability_inventory
+from .vapi import KEY_FILE, KEY_VARIABLES
 from .workspace import BuildError, Workspace, digest_json, read_json, utc_now, write_json
+
+RESERVED_ENV = set(KEY_VARIABLES) | {"VAPI_BASE_URL"}
 
 SCHEMA_PATH = Path(__file__).with_name("schemas") / "plan.schema.json"
 DEFAULT_RUNTIME = {
@@ -55,14 +58,22 @@ def check_plan(workspace: Workspace) -> dict[str, Any]:
         if classification["risk"] == "PRIVILEGED" and not plan["agent"].get("allowPrivileged"):
             errors.append(f"{tool['operationId']} looks administrative or internal ({operation['method']} {operation['path']}); set agent.allowPrivileged only if the user explicitly wants it exposed to callers.")
         if classification["confirmBeforeCall"] and not tool.get("confirmBeforeCall"):
-            errors.append(f"{tool['operationId']} changes data or money; set confirmBeforeCall: true so the agent reads back and confirms first.")
+            if tool.get("skipConfirmationReason"):
+                warnings.append(f"{tool['operationId']} is a write that will run without a read-back: {tool['skipConfirmationReason']}")
+            else:
+                errors.append(f"{tool['operationId']} is a {operation['method']} (a write); set confirmBeforeCall: true, or give skipConfirmationReason for a login-style call with nothing to read back.")
         auth = tool.get("auth", {"mode": "NONE"})
-        if auth["mode"] == "BEARER_ENV" and not auth.get("env"):
-            errors.append(f"{tool['operationId']} auth BEARER_ENV needs `env`, the environment variable holding the bearer token at apply time.")
+        if auth["mode"] == "HEADER_ENV":
+            if not auth.get("env"):
+                errors.append(f"{tool['operationId']} auth HEADER_ENV needs `env`: the variable name the user saved in {KEY_FILE} holding the token.")
+            elif auth["env"] in RESERVED_ENV or auth["env"].startswith(("AWS_", "ANTHROPIC_", "OPENAI_", "GITHUB_", "VAPI_")) or "SECRET" in auth["env"]:
+                errors.append(f"{tool['operationId']} names {auth['env']}, which is a platform or provider secret; use a variable the user created for this API.")
         if auth["mode"] == "VAPI_CREDENTIAL" and not auth.get("credentialId"):
             errors.append(f"{tool['operationId']} auth VAPI_CREDENTIAL needs `credentialId` of an existing Vapi credential.")
-        if classification["requiresAuth"] and auth["mode"] == "NONE":
+        if classification["requiresAuth"] and auth["mode"] == "NONE" and not tool.get("headers"):
             warnings.append(f"{tool['operationId']} declares a security requirement but the tool has no auth; calls may fail with 401.")
+        if any(name.casefold() == (auth.get("headerName") or "Authorization").casefold() for name in (tool.get("headers") or {})) and auth["mode"] == "HEADER_ENV":
+            errors.append(f"{tool['operationId']} sets the same header through `headers` and `auth`; keep one.")
         name = tool.get("name") or openapi.tool_name(tool["operationId"], set(taken))
         if name in taken:
             errors.append(f"Tool name {name} is used twice.")
@@ -84,6 +95,8 @@ def check_plan(workspace: Workspace) -> dict[str, Any]:
         errors.append("Assistant names must be unique (handoffs address assistants by name).")
     covered_jobs: set[str] = set()
     for assistant in plan["assistants"]:
+        if len(assistant["name"]) > 40:
+            errors.append(f"Assistant name “{assistant['name']}” is longer than Vapi's 40-character limit.")
         for job_id in assistant["jobs"]:
             if job_id not in job_ids:
                 errors.append(f"Assistant {assistant['id']} lists unknown {job_id}.")
@@ -107,6 +120,8 @@ def check_plan(workspace: Workspace) -> dict[str, Any]:
     server_url = runtime.get("serverUrl") or inventory.get("serverUrl")
     if tools_by_operation and not server_url:
         errors.append("No server URL for the tools: set runtime.serverUrl (for example https://standardcharter.co).")
+    if server_url and not str(server_url).startswith("https://"):
+        errors.append(f"The tools' server URL must use https, got {server_url}; set runtime.serverUrl.")
     runtime["serverUrl"] = server_url
     tool_operations = {operation_id: operations[operation_id] for operation_id in tools_by_operation}
     used_tools = {t for a in plan["assistants"] for t in a.get("tools", [])}
@@ -123,11 +138,17 @@ def check_plan(workspace: Workspace) -> dict[str, Any]:
         "knowledge": {**DEFAULT_KNOWLEDGE, **plan.get("knowledge", {})},
         "resolvedTools": [{**tools_by_operation[op], "operation": {k: v for k, v in tool_operations[op].items() if k not in {"text"}}} for op in tools_by_operation],
         "ontologyDigest": ontology["digest"],
-        "enabledOperations": sorted(f"{tool_operations[op]['method']} {tool_operations[op]['path']} ({op})" for op in tools_by_operation),
+        "enabledOperations": sorted(f"{tool_operations[op]['method']} {tool_operations[op]['path']} ({op}) · risk {tool_operations[op]['classification']['risk']}"
+                                    + (" · confirms first" if tools_by_operation[op].get("confirmBeforeCall") else " · NO read-back" if tool_operations[op]["classification"]["confirmBeforeCall"] else "")
+                                    for op in tools_by_operation),
     }
-    candidate["digest"] = digest_json({k: v for k, v in candidate.items() if k != "digest"})
+    candidate["digest"] = plan_digest(candidate)
     candidate["checkedAt"] = utc_now()
     return _finish(workspace, plan, candidate, errors, warnings)
+
+
+def plan_digest(candidate: dict[str, Any]) -> str:
+    return digest_json({k: v for k, v in candidate.items() if k not in {"digest", "checkedAt"}})
 
 
 def _finish(workspace: Workspace, plan: dict[str, Any], candidate: dict[str, Any] | None, errors: list[str], warnings: list[str]) -> dict[str, Any]:
@@ -216,8 +237,8 @@ def approved_plan(workspace: Workspace) -> dict[str, Any]:
         raise BuildError("The plan has not been approved. Run `approve plan` after review.")
     approval = read_json(approval_path)
     candidate = load_candidate(workspace)
-    if candidate["digest"] != approval["digest"]:
-        raise BuildError("The plan changed after approval. Re-check and re-approve it.")
+    if plan_digest(candidate) != approval["digest"] or candidate.get("digest") != approval["digest"]:
+        raise BuildError("The plan candidate differs from what was approved. Run `check plan` and approve it again.")
     ontology = approved_ontology(workspace)
     if ontology["digest"] != approval["ontologyDigest"]:
         raise BuildError("The ontology changed after the plan was approved. Re-check and re-approve the plan.")

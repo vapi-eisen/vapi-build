@@ -24,7 +24,7 @@ def cmd_doctor(args) -> int:
             importlib.import_module(module)
             print(f"  ok   {module}")
         except ImportError:
-            print(f"  MISSING {module}  (pip install {'pyyaml' if module == 'yaml' else module})")
+            print(f"  MISSING {module}  (pip install {'pyyaml' if module == 'yaml' else module}){'; only needed for s3:// sources' if module == 'boto3' else ''}")
     _, source = vapi.find_key()
     print(f"  {'ok  ' if source else 'unset'} Vapi private key" + (f" from {source}" if source else f" (export VAPI_API_KEY or save VAPI_API_KEY=… in {vapi.KEY_FILE}; needed only for apply/test/teardown)"))
     aws = any(os.environ.get(k) for k in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID")) or Path("~/.aws/credentials").expanduser().exists() or Path("~/.aws/config").expanduser().exists()
@@ -61,6 +61,9 @@ def cmd_add(args) -> int:
 def cmd_fetch(args) -> int:
     workspace = _workspace(args)
     for inventory in sources.fetch_all(workspace, only=args.only):
+        if inventory.get("error"):
+            print(f"{inventory['source']}: FAILED — {inventory['error']}")
+            continue
         print(f"{inventory['source']}: {inventory['itemCount']} items, {inventory['byteCount']:,} bytes")
         if inventory.get("sampling"):
             s = inventory["sampling"]
@@ -85,6 +88,8 @@ def cmd_extract(args) -> int:
         print(f"  {workspace.path(packet)}")
     if summary["gaps"]:
         print(f"Gaps are listed in {workspace.path('evidence', 'ledger.json')} under `gaps`.")
+    for note in summary.get("oversizedPackets", []):
+        print(f"  note: {note}")
     return 0
 
 
@@ -171,6 +176,8 @@ def cmd_merge(args) -> int:
             print(f"  {key}: {value}")
     for duplicate in report.get("possibleDuplicates", []):
         print(f"  same label, different ids → merge or distinguish: {duplicate}")
+    for warning in report.get("warnings", []):
+        print(f"  warn  {warning}")
     if report["status"] == "MERGED":
         print(f"Wrote {workspace.path('ontology', 'ontology.json')}. Next: review duplicates, then `check ontology`.")
     return 0 if report["status"] == "MERGED" else 1
@@ -179,6 +186,9 @@ def cmd_merge(args) -> int:
 def cmd_test(args) -> int:
     workspace = _workspace(args)
     report = vapi.run_tests(workspace, vapi.client_from_env())
+    if not report["results"]:
+        print("The plan declares no tests; nothing to run. Talk to the assistant in the Vapi dashboard instead.")
+        return 0
     print(vapi.render_test_report(report))
     print(f"Saved {workspace.path('vapi', 'test-results.json')}. Judge each transcript against its expectations and report the verdicts.")
     return 0
@@ -202,7 +212,13 @@ def cmd_status(args) -> int:
         approval = workspace.path(stage, "approval.json")
         state = "approved" if approval.exists() else read_json(check)["status"] if check.exists() else "not checked"
         print(f"  {stage}: {state}")
-    print(f"  build: {'compiled' if workspace.path('vapi', 'build.json').exists() else 'not compiled'}")
+    build_path = workspace.path("vapi", "build.json")
+    plan_approval = workspace.path("plan", "approval.json")
+    if build_path.exists() and plan_approval.exists():
+        stale = read_json(build_path).get("planDigest") != read_json(plan_approval).get("digest")
+        print(f"  build: {'STALE (plan changed; run compile)' if stale else 'compiled'}")
+    else:
+        print(f"  build: {'compiled' if build_path.exists() else 'not compiled'}")
     receipts = vapi.load_receipts(workspace)
     if receipts:
         print(f"  applied: kb {receipts['knowledgeBase'].get('id')}, {len(receipts['tools'])} tools, {len(receipts['assistants'])} assistants, verified={receipts['verified']}")

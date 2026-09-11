@@ -19,7 +19,7 @@ The launcher is `~/.claude/skills/vapi-build/vapi-build` (this skill's directory
 - Report progress from what the CLI wrote: counts, digests, paths. Never estimate or narrate work you have not done.
 
 ## Preflight
-Run `$VB doctor`. If a Python dependency is missing, say which and stop. If the Vapi private key is unset, tell the user once, in one sentence, that before the build step they need to save a line `VAPI_API_KEY=<their private key>` into `~/.config/vapi-build/env` (or export it in the shell they start Claude Code from), then carry on: everything up to `compile` works without it.
+Run `$VB doctor`. If jsonschema or PyYAML is missing, say which and stop; a missing boto3 only matters when a source is on S3. If the Vapi private key is unset, tell the user once, in one sentence, that before the build step they need to save a line `VAPI_API_KEY=<their private key>` into `~/.config/vapi-build/env` (or export it in the shell they start Claude Code from), then carry on: everything up to `compile` works without it. Any API token the agent's tools need goes into that same file as another `NAME=value` line; ask the user for the variable name, never the value.
 
 ## Intake: one message of questions
 Ask everything you need in a single message (use AskUserQuestion when it is available). Do not start fetching until you have at least one source.
@@ -30,7 +30,7 @@ Ask everything you need in a single message (use AskUserQuestion when it is avai
 - Transcripts: location, plus which of `synthetic`, `redacted`, or `raw` describes them. Default sample is 40 conversations; ask if they want more. Raw transcripts are never shown to you.
 - OpenAPI: URL or file, and the base URL the live agent's tools should call (for example `https://standardcharter.co`).
 - AWS profile name if any source is on S3 and their default credentials will not reach it.
-- Audience (customers, employees, both), anything the agent must not do, and how any authenticated API operations should authenticate: an environment variable holding a service bearer token, an existing Vapi credential ID, or a login operation whose response carries a token.
+- Audience (customers, employees, both), anything the agent must not do, and how any authenticated API operations should authenticate: a token the user saves in `~/.config/vapi-build/env` (they tell you the variable name), an existing Vapi credential ID, or a login operation whose response carries a token.
 
 Confirm what you heard in two or three lines, then proceed without waiting.
 
@@ -50,7 +50,7 @@ If one source fails, report it and continue with the others; only stop if nothin
 Read `<ws>/evidence/packets/*.md` in order and write `<ws>/ontology/ontology.json` per the ontology guide.
 
 - Up to four packets: do it yourself, keeping working notes in `<ws>/ontology/notes.md` as you read.
-- More than four packets: fan out. For each packet spawn one subagent (Agent tool) with the packet path, the ontology guide path, the fragment rules, and a packet number NN. Each writes `<ws>/ontology/fragments/NN.json`: a partial ontology (no `capabilities`) whose record IDs end in `-pNN`, citing only evidence from its packet. Then `$VB merge <ws>` concatenates them and lists same-label records under different IDs. Consolidate: merge true duplicates into one canonical ID, rewrite every reference, keep genuine distinctions, add `capabilities` aligned to goals, and write the result to `ontology.json`.
+- More than four packets: fan out. For each packet spawn one subagent (Agent tool) with the packet path, the ontology guide path, the fragment rules, and a packet number NN. Each writes `<ws>/ontology/fragments/NN.json`: a partial ontology (no `capabilities`, no `domain`) whose record IDs end in `-pNN`, citing only evidence from its packet. Then `$VB merge <ws>` concatenates them and lists same-label records under different IDs. Consolidate: write `domain`, merge true duplicates into one canonical ID, rewrite every reference, keep genuine distinctions, add `capabilities` aligned to goals, and write the result to `ontology.json`.
 
 ```bash
 $VB check ontology <ws>
@@ -68,7 +68,7 @@ Write `<ws>/plan/plan.json` per the plan guide, then:
 $VB check plan <ws>
 $VB summarize plan <ws>
 ```
-Fix errors the same way. **Gate 2.** Present the plan and read the check's "operations the agent will be able to call" list verbatim, with each one's risk. Ask which to keep. On yes: `$VB approve plan <ws>`.
+Fix errors the same way. **Gate 2.** Present the plan and read the check's "operations the agent will be able to call" list verbatim; it carries each operation's risk and whether the agent confirms before calling it. Ask which to keep. On yes: `$VB approve plan <ws>`.
 
 ## Build, test, hand over
 ```bash
@@ -77,9 +77,9 @@ $VB compile <ws>
 **Gate 3.** Show what will be created from `<ws>/vapi/summary.md`: knowledge files, tools with URLs and auth, assistants, squad, and any environment variable a bearer credential needs. Confirm the key file is in place (`$VB doctor`). On yes:
 ```bash
 $VB apply <ws> --yes
-$VB test <ws>
+$VB test <ws>          # when the plan has tests
 ```
-Judge each chat transcript against its `expect` and `mustNot` lines and report a verdict per scenario with the agent's actual words. For failures that a prompt or plan change would fix, propose the change; applying a changed plan means `teardown --yes` then `apply --yes` again (the CLI refuses to mix receipts from two plans). Finish with the resource IDs, how to talk to the agent in the Vapi dashboard, and the offer to remove everything with `$VB teardown <ws> --yes`.
+Judge each chat transcript against its `expect` and `mustNot` lines and report a verdict per scenario with the agent's actual words. For failures that a prompt or plan change would fix, propose the change and, on yes, redo the chain: edit `plan.json`, `check plan`, `approve plan` (Gate 2 again), `compile`, `teardown --yes`, `apply --yes`. `apply` refuses a build compiled from an older plan, so the order matters. Finish with the resource IDs, how to talk to the agent in the Vapi dashboard, and the offer to remove everything with `$VB teardown <ws> --yes`.
 
 ## Command reference
 | Command | Purpose |

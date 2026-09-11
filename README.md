@@ -15,7 +15,7 @@ Sources are specified in the conversation, never checked into this repo. Project
 
 Say `/vapi-build` in any Claude Code session and name your material. The skill asks for what it needs (sources and their roles, transcript privacy, the API base URL, audience, auth), then does every step itself and stops only for three yes/no gates: the ontology, the plan with the exact operations the agent may call, and the build. It then creates the Vapi resources and runs the plan's test scenarios through Vapi chat.
 
-The one thing you do by hand, once: save your Vapi private key where the CLI reads it.
+The one thing you do by hand, once: save your Vapi private key where the CLI reads it. Tokens for the APIs the agent calls go in the same file as extra `NAME=value` lines; the skill asks you for the names, never the values.
 
 ```bash
 mkdir -p ~/.config/vapi-build && echo 'VAPI_API_KEY=<your private key>' > ~/.config/vapi-build/env && chmod 600 ~/.config/vapi-build/env
@@ -41,8 +41,9 @@ Every evidence ID Claude cites is an exact character span in a pinned segment; t
 ## Safety defaults
 
 - Transcripts require a privacy attestation (`synthetic`, `redacted`, or `raw`); raw transcripts are never shown to the model or uploaded. A pattern scan reports emails, phone numbers, card-like and SSN-like strings.
-- Every OpenAPI operation starts disabled. Administrative operations are refused unless explicitly allowed; write, financial, and destructive operations must be marked `confirmBeforeCall`, which the compiled prompt turns into a read-back and explicit confirmation.
-- API keys and bearer tokens come from the environment at apply time and are never written to disk or printed.
+- Every OpenAPI operation starts disabled. Administrative operations are refused unless explicitly allowed; every non-read operation must be marked `confirmBeforeCall`, which the compiled prompt turns into a read-back and explicit confirmation, unless the plan states a reason to skip it (a login call) and the user sees that at the gate.
+- API keys and tokens are read from the environment or `~/.config/vapi-build/env` at apply time, injected into request headers only in the live request, and never written into build files, receipts, or output. A plan cannot name a platform secret, and a token equal to the Vapi key is refused.
+- Builds are digest-bound: a changed ontology invalidates the plan, a changed plan or re-extracted evidence invalidates the build, and `apply` refuses stale builds.
 - HTTPS only for remote sources, no private-network hosts, bounded page counts, object counts, and byte budgets.
 
 ## Develop
