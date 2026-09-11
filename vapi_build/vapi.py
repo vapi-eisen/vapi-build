@@ -174,31 +174,48 @@ def apply(workspace: Workspace, client: VapiClient, *, secrets: dict[str, str] |
             if token == client._key:
                 raise BuildError(f"{header['env']} holds the Vapi private key itself; a tool must never forward it. Use the API's own token.")
 
+    mode = receipts["knowledgeBase"].get("mode", "v2")
     for file in build["knowledgeBase"]["files"]:
         if file["path"] in receipts["files"]:
             continue
         data = workspace.path("vapi", file["path"]).read_bytes()
-        created = client.upload(file["name"], data, metadata={"managedBy": "vapi-build", "project": build["projectSlug"], "origin": file["origin"]})
-        if not created or not created.get("id") or created.get("status") == "failed":
+        metadata = {"managedBy": "vapi-build", "project": build["projectSlug"], "origin": file["origin"]}
+        try:
+            created = client.upload(file["name"], data, purpose="knowledge-base-v2" if mode == "v2" else "assistant", metadata=metadata)
+        except BuildError as error:
+            if mode == "v2" and V2_DISABLED_MARKER in str(error):
+                # The organization has no Knowledge Bases V2: use Vapi's query tool with Google as the provider instead.
+                mode = "query"
+                receipts["knowledgeBase"] = {"mode": "query", "attached": []}
+                _save(workspace, receipts)
+                created = client.upload(file["name"], data, purpose="assistant", metadata=metadata)
+            else:
+                raise
+        if not created or not created.get("id"):
+            raise BuildError(f"Vapi did not accept {file['name']}.")
+        if mode == "v2" and created.get("status") == "failed":
             raise BuildError(f"Vapi did not accept {file['name']}.")
         receipts["files"][file["path"]] = {"id": created["id"], "sha256": file["sha256"]}
         _save(workspace, receipts)
 
-    if not receipts["knowledgeBase"].get("id"):
+    if mode == "query":
+        _ensure_query_tool(workspace, client, build, receipts, sleep, poll_seconds, timeout_seconds)
+    elif not receipts["knowledgeBase"].get("id"):
         created = client.request("POST", "/v2/knowledge-base", {"name": build["knowledgeBase"]["name"], "description": build["knowledgeBase"]["description"]})
         receipts["knowledgeBase"] = {"id": created["id"], "attached": [], "toolId": created.get("toolId")}
         _save(workspace, receipts)
-    knowledge_base_id = receipts["knowledgeBase"]["id"]
-    file_ids = [entry["id"] for entry in receipts["files"].values()]
-    for file_id in file_ids:
-        if file_id in receipts["knowledgeBase"]["attached"]:
-            continue
-        client.request("POST", f"/v2/knowledge-base/{knowledge_base_id}/file", {"fileId": file_id})
-        receipts["knowledgeBase"]["attached"].append(file_id)
-        _save(workspace, receipts)
-    if not receipts["knowledgeBase"].get("toolId"):
-        receipts["knowledgeBase"]["toolId"] = _wait_for_knowledge(client, knowledge_base_id, file_ids, sleep, poll_seconds, timeout_seconds)
-        _save(workspace, receipts)
+    if mode == "v2":
+        knowledge_base_id = receipts["knowledgeBase"]["id"]
+        file_ids = [entry["id"] for entry in receipts["files"].values()]
+        for file_id in file_ids:
+            if file_id in receipts["knowledgeBase"]["attached"]:
+                continue
+            client.request("POST", f"/v2/knowledge-base/{knowledge_base_id}/file", {"fileId": file_id})
+            receipts["knowledgeBase"]["attached"].append(file_id)
+            _save(workspace, receipts)
+        if not receipts["knowledgeBase"].get("toolId"):
+            receipts["knowledgeBase"]["toolId"] = _wait_for_knowledge(client, knowledge_base_id, file_ids, sleep, poll_seconds, timeout_seconds)
+            _save(workspace, receipts)
 
     for tool in build["tools"]:
         if tool["ref"] in receipts["tools"]:
@@ -237,6 +254,47 @@ def apply(workspace: Workspace, client: VapiClient, *, secrets: dict[str, str] |
     return receipts
 
 
+V2_DISABLED_MARKER = "Knowledge Bases V2 is not enabled"
+
+
+def _ensure_query_tool(workspace: Workspace, client: VapiClient, build: dict[str, Any], receipts: dict[str, Any], sleep: Callable[[float], None],
+                       poll_seconds: float, timeout_seconds: float) -> None:
+    """Non-V2 organizations: one `query` tool whose Google knowledge base holds every uploaded file."""
+    file_ids = [entry["id"] for entry in receipts["files"].values()]
+    # Wait for Vapi to finish processing the uploads; a file Vapi marks failed is reported but does not stop the build,
+    # because the query tool's provider indexes the files itself.
+    waited = 0.0
+    while True:
+        statuses = {}
+        for file_id in file_ids:
+            record = client.request("GET", f"/file/{file_id}", allow_404=True) or {}
+            statuses[file_id] = record.get("status") or "done"
+        if all(status != "processing" for status in statuses.values()) or waited >= timeout_seconds:
+            break
+        sleep(poll_seconds)
+        waited += poll_seconds
+    failed = [fid for fid, status in statuses.items() if status == "failed"]
+    receipts["knowledgeBase"]["fileStatuses"] = statuses
+    if receipts["knowledgeBase"].get("toolId"):
+        return
+    slug = build["projectSlug"]
+    payload = {
+        "type": "query",
+        "function": {"name": f"{slug}-knowledge"[:64], "description": "Search the knowledge base of product guides and website pages before answering a factual question."},
+        "knowledgeBases": [{
+            "provider": "google",
+            "name": f"{slug}-knowledge"[:64],
+            "description": build["knowledgeBase"]["description"][:1000],
+            "fileIds": file_ids,
+        }],
+    }
+    created = client.request("POST", "/tool", payload)
+    receipts["knowledgeBase"]["toolId"] = created["id"]
+    receipts["knowledgeBase"]["attached"] = list(file_ids)
+    receipts["knowledgeBase"]["failedFiles"] = failed
+    _save(workspace, receipts)
+
+
 def _wait_for_knowledge(client: VapiClient, knowledge_base_id: str, file_ids: list[str], sleep: Callable[[float], None], poll_seconds: float, timeout_seconds: float) -> str:
     waited = 0.0
     while True:
@@ -268,6 +326,8 @@ def verify(workspace: Workspace, client: VapiClient, receipts: dict[str, Any] | 
     checks += [("assistant", i) for i in receipts["assistants"].values()] + [("tool", i) for i in receipts["tools"].values()]
     if receipts["knowledgeBase"].get("id"):
         checks.append(("v2/knowledge-base", receipts["knowledgeBase"]["id"]))
+    elif receipts["knowledgeBase"].get("mode") == "query" and receipts["knowledgeBase"].get("toolId"):
+        checks.append(("tool", receipts["knowledgeBase"]["toolId"]))
     seen = []
     for kind, identifier in checks:
         resource = client.request("GET", f"/{kind}/{identifier}")
@@ -304,6 +364,8 @@ def teardown(workspace: Workspace, client: VapiClient) -> list[str]:
         if remove("tool", receipts["tools"][ref]):
             receipts["tools"].pop(ref)
     if receipts["knowledgeBase"].get("id") and remove("v2/knowledge-base", receipts["knowledgeBase"]["id"]):
+        receipts["knowledgeBase"] = {}
+    elif receipts["knowledgeBase"].get("mode") == "query" and receipts["knowledgeBase"].get("toolId") and remove("tool", receipts["knowledgeBase"]["toolId"]):
         receipts["knowledgeBase"] = {}
     for path in list(receipts["files"]):
         entry = receipts["files"][path]

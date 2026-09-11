@@ -182,10 +182,11 @@ def valid_plan() -> dict:
 class FakeVapi:
     """Records calls and answers like Vapi does, including knowledge-base indexing."""
 
-    def __init__(self, *, kb_tool_in_get: bool = True) -> None:
+    def __init__(self, *, kb_tool_in_get: bool = True, v2_enabled: bool = True) -> None:
         self.calls: list[tuple[str, str, dict | None]] = []
         self.counter = 0
         self.kb_tool_in_get = kb_tool_in_get
+        self.v2_enabled = v2_enabled
         self.files: list[str] = []
 
     def __call__(self, method: str, url: str, headers: dict, data: bytes | None):
@@ -196,7 +197,10 @@ class FakeVapi:
         self.calls.append((method, path, body))
         assert headers["Authorization"].startswith("Bearer ")
         if method == "POST" and path == "/file":
-            assert b'name="purpose"\r\n\r\nknowledge-base-v2' in data
+            v2 = b'name="purpose"\r\n\r\nknowledge-base-v2' in data
+            if not self.v2_enabled and v2:
+                return 403, json.dumps({"message": "Knowledge Bases V2 is not enabled for your organization.", "error": "Forbidden", "statusCode": 403}).encode()
+            assert v2 or not self.v2_enabled
             self.counter += 1
             self.files.append(f"file_{self.counter}")
             return 201, json.dumps({"id": f"file_{self.counter}", "status": "processing"}).encode()
@@ -214,6 +218,8 @@ class FakeVapi:
             identifier = path.rsplit("/", 1)[1]
             payload = {"id": identifier, "files": [{"fileId": f, "status": "ready"} for f in self.files], "toolId": "tool_kb" if self.kb_tool_in_get else None}
             return 200, json.dumps(payload).encode()
+        if method == "GET" and path.startswith("/file/"):
+            return 200, json.dumps({"id": path.rsplit("/", 1)[1], "status": "done"}).encode()
         if method == "GET" and path.startswith("/tool?"):
             return 200, json.dumps([{"id": "tool_kb_listed", "type": "knowledgeBase", "knowledgeBaseId": "knowledge-base_" + str([c for c in self.calls if c[1] == "/v2/knowledge-base" and c[0] == "POST"] and self.counter)}]).encode()
         if method == "GET":

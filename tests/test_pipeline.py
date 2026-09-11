@@ -309,3 +309,24 @@ def test_render_ontology_and_plan_pages(project):
     page = render.render_plan(project).read_text()
     assert "Harbor Light Concierge" in page and "createBooking" in page and "enabledOperations" in page
     assert project.path("plan", "plan.html").exists()
+
+
+def test_apply_falls_back_to_query_tool_without_knowledge_v2(project, monkeypatch):
+    approved(project)
+    project.path("plan", "plan.json").write_text(json.dumps(valid_plan()))
+    assert plan.check_plan(project)["status"] == "CANDIDATE"
+    plan.approve_plan(project, by="tester")
+    compiler.compile_build(project)
+    fake = FakeVapi(v2_enabled=False)
+    client = vapi.VapiClient("sk-test", transport=fake)
+    receipts = vapi.apply(project, client, secrets={"FERRY_TOKEN": "t"}, sleep=lambda s: None)
+    assert receipts["knowledgeBase"]["mode"] == "query"
+    query_posts = [c for c in fake.calls if c[0] == "POST" and c[1] == "/tool" and c[2].get("type") == "query"]
+    assert len(query_posts) == 1
+    kb = query_posts[0][2]["knowledgeBases"][0]
+    assert kb["provider"] == "google" and set(kb["fileIds"]) == {e["id"] for e in receipts["files"].values()}
+    assert not any(c[1].startswith("/v2/knowledge-base") for c in fake.calls)
+    for assistant in [c for c in fake.calls if c[0] == "POST" and c[1] == "/assistant"]:
+        assert assistant[2]["model"]["toolIds"][0] == receipts["knowledgeBase"]["toolId"]
+    removed = vapi.teardown(project, client)
+    assert any(r == f"tool {receipts['knowledgeBase']['toolId']}" for r in removed)
