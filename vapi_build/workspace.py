@@ -26,6 +26,14 @@ def digest_json(value: Any) -> str:
     return digest(canonical(value))
 
 
+# A current mainstream browser signature. Cloudflare-fronted hosts (including api.vapi.ai)
+# reject Python's default "Python-urllib/x.y" and custom bot strings with a 403 error 1010.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 

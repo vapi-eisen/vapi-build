@@ -16,14 +16,14 @@ from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .workspace import BuildError, Workspace, read_json, utc_now, write_json
+from .workspace import USER_AGENT, BuildError, Workspace, read_json, utc_now, write_json
 
 Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, bytes]]
 KEY_VARIABLES = ("VAPI_API_KEY", "VAPI_PRIVATE_KEY")
 
 
 def default_transport(method: str, url: str, headers: dict[str, str], data: bytes | None) -> tuple[int, bytes]:
-    request = Request(url, data=data, method=method, headers=headers)
+    request = Request(url, data=data, method=method, headers={"User-Agent": USER_AGENT, **headers})
     try:
         with urlopen(request, timeout=60) as response:  # noqa: S310 - fixed Vapi API host
             return response.status, response.read()

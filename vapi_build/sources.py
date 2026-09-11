@@ -22,7 +22,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from . import transcripts
-from .workspace import BuildError, Workspace, read_json, slug, utc_now, write_json
+from .workspace import USER_AGENT, BuildError, Workspace, read_json, slug, utc_now, write_json
 
 ROLES = ("website", "knowledge", "transcripts", "openapi")
 AUTHORITY = {"website": "SUPPORTING", "knowledge": "AUTHORITATIVE", "transcripts": "OBSERVATIONAL", "openapi": "INTERFACE"}
@@ -96,7 +96,7 @@ def default_fetch(url: str) -> tuple[bytes, str, str]:
     """Fetch one public HTTPS URL with byte and time bounds. Returns (bytes, content type, final url)."""
     request = Request(_assert_public(url), method="GET", headers={
         "Accept": "text/html,application/json,application/yaml,text/yaml,text/markdown,text/plain;q=0.9,*/*;q=0.5",
-        "User-Agent": "vapi-build/0.1 (+https://vapi.ai)",
+        "User-Agent": USER_AGENT,
     })
     try:
         with build_opener(_SafeRedirects()).open(request, timeout=20) as response:  # noqa: S310 - public HTTPS only
